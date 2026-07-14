@@ -1,0 +1,6 @@
+{
+    "python.pythonPath": ".venv/bin/python",
+    "mypy-type-checker.interpreter": [".venv/bin/python"],
+    "python.linting.mypyEnabled": true,
+    "python.analysis.extraPaths": [".venv/lib/python3.12/site-packages"]
+}

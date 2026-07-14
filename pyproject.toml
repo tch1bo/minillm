@@ -1,0 +1,47 @@
+[project]
+name = "minillm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "datasets",
+    "ipython>=9.15.0",
+    "pydantic-settings>=2.14.2",
+    "structlog>=26.1.0",
+    "tensorboard>=2.21.0",
+    "tiktoken>=0.13.0",
+    "torch>=2.13.0",
+    "tqdm",
+    "types-tqdm",
+]
+
+[tool.ruff.lint]
+select = ["I", "F401"]
+
+[tool.mypy]
+explicit_package_bases = true
+exclude = [".venv"]
+follow_imports = "silent"
+cache_dir = ".mypy_cache"
+follow_untyped_imports = true
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }
+
+[tool.pyright]
+exclude = [".venv"]
+
+[dependency-groups]
+dev = [
+    "black>=26.5.1",
+    "mypy>=2.2.0",
+    "pre-commit>=4.6.0",
+    "pyright>=1.1.411",
+    "ruff>=0.15.21",
+]
