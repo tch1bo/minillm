@@ -4,6 +4,7 @@ from typing import Self, cast
 import pydantic
 import torch
 from torch.nn import Module, ModuleList
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from src.utils import get_logger
 
@@ -103,10 +104,27 @@ class Attention(Module):
         q = self.rope(q)
         k = self.rope(k)
 
-        # z is (b, head, token, attention_dim)
-        z = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, is_causal=True, dropout_p=0, enable_gqa=True
-        )
+        # Compute attention
+        # NOTE: my GPU is from the older generation and FLASH_ATTENTION is not supported for it.
+        # Instead we have to use the EFFICIENT_ATTENTION backend, which is
+        # slower, but still reduces the memory consumption from quadratic to linear (of max_len).
+        # On a batch of 4, the memory dropped from 2736.0 MB to 218.2 MB
+        # (this allowed increasing the batch size from 4 to 10).
+        # NOTE(2): An annoying part is that the EFFICIENT_ATTENTION backend
+        # doesn't support the `enable_gqa` flag, so we have to repeat the k/v tensors.
+        with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+            k = k.repeat_interleave(self.Q.shape[0] // (2 * self.KV.shape[0]), dim=1)
+            v = v.repeat_interleave(self.Q.shape[0] // (2 * self.KV.shape[0]), dim=1)
+            # z is (b, head, token, attention_dim)
+            z = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=True,
+                dropout_p=0,
+                # This should be set to True on a newer GPU (and the interleaving should be dropped)
+                enable_gqa=False,
+            )
         # reshape z to (b, token, attention_dim * num_heads)
         z = z.transpose(1, 2).reshape(batch_size, num_tokens, -1)
         return self.proj(z)
@@ -163,16 +181,17 @@ class Model(Module):
             torch.nn.init.normal_(block.ff.gate_and_value.weight, std=std)
             torch.nn.init.normal_(block.ff.down.weight, std=residual_std)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO(chibo): KV-cache for inference?
+    def forward_no_lm_head(self, x: torch.Tensor) -> torch.Tensor:
         y = self.embedding(x)
         for block in self.blocks:
             y = block(y)
 
-        y = self.final_rms_norm(y)
-        logits = self.lm_head(y)
-        logits[..., self.vocab_size :] = float("-inf")
-        return logits
+        return self.final_rms_norm(y)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # TODO(chibo): KV-cache for inference?
+        y = self.forward_no_lm_head(x)
+        return self.lm_head(y)
 
 
 def num_params(m: Module) -> int:

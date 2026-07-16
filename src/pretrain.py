@@ -13,6 +13,7 @@ import tqdm
 from pydantic import BaseModel, Field
 from torch.nn.functional import cross_entropy
 from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -46,8 +47,12 @@ class PreTrainArgs(BaseModel):
     lr_warmup_ratio: float = 0.1
     mem_profile_path: Path | None = Field(
         default=None,
-        description="If not None, then this script will run one forward step with the memory profiler "
+        description="If not None, then this script will run several steps with the memory profiler "
         "on and dump the profile to the supplied path. If None, then the pretraining will run without memory profiling",
+    )
+    num_ce_chunks: int = Field(
+        default=8,
+        description="The number of chunks to split the logits into for computing the cross entropy",
     )
 
     def cli_cmd(self) -> None:
@@ -192,6 +197,7 @@ def pre_train(args: PreTrainArgs) -> None:
         batch_size=args.train_batch_size,
         shuffle=True,
         pin_memory=True,
+        drop_last=True,
     )
     test_dataloader = DataLoader(
         test, batch_size=args.eval_batch_size, drop_last=True, pin_memory=True
@@ -232,33 +238,43 @@ def pre_train(args: PreTrainArgs) -> None:
     writer = SummaryWriter(log_dir=args.out_dir)
     logger.info("starting training", out_dir=args.out_dir, use_fp16=use_fp16)
 
-    def get_loss(batch: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
-        x, targets = batch
-        x, targets = x.to(device, non_blocking=True), targets.to(
-            device, non_blocking=True
-        )
-        with torch.autocast(device, dtype=torch.float16, enabled=use_fp16):
-            logits = model(x)
-            return cross_entropy(
-                logits.reshape(-1, logits.shape[-1]), targets.reshape(-1)
-            )
-
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
+
+    def chunked_loss(
+        x: torch.Tensor, targets: torch.Tensor, is_train: bool
+    ) -> torch.Tensor:
+        # NOTE: the direct cross_entropy loss calculation was taking too much memory:
+        #   batch_size * len_size * vocab_size * (sizeof(fp32) + sizeof(fp16))
+        # which for a batch of 10 was around 3GB
+        # Splitting it into N chunks reduces the peak memory N times at a slightly higher compute
+        # cost (we have to recompute the `lm_head(hidden)` in the backward pass)
+        # This optimization allowed to increase the max batch size from 8 to 16 on my 12GB GPU
+        def _chunk_loss(h: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            logits = model.lm_head(h)
+            return cross_entropy(logits.flatten(0, 1), t.flatten(), reduction="sum")
+
+        with torch.autocast(device, dtype=torch.float16, enabled=use_fp16):
+            hidden = model.forward_no_lm_head(x)
+            loss = hidden.new_zeros((), dtype=torch.float32)
+            for h, t in zip(
+                hidden.chunk(args.num_ce_chunks, dim=1),
+                targets.chunk(args.num_ce_chunks, dim=1),
+            ):
+                if is_train:
+                    loss = loss + checkpoint(_chunk_loss, h, t, use_reentrant=False)
+                else:
+                    loss = loss + _chunk_loss(h, t)
+
+            return loss / targets.numel()
+
     for i, batch in enumerate(tqdm.tqdm(train_dataloader, desc=f"training")):
         model.train()
 
-        loss = get_loss(batch)
-        if args.mem_profile_path is not None:
-            torch.cuda.memory._dump_snapshot(str(args.mem_profile_path))
-            logger.info(
-                "dumped the memory profile after one forward pass",
-                out_path=args.mem_profile_path,
-            )
-            return
-
-        optimizer.zero_grad()
+        x, targets = batch[0].to(device, non_blocking=True), batch[1].to(
+            device, non_blocking=True
+        )
+        loss = chunked_loss(x, targets, is_train=True)
         scaler.scale(loss).backward()
-
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scale_before = scaler.get_scale()
@@ -270,16 +286,31 @@ def pre_train(args: PreTrainArgs) -> None:
 
         if scaler.get_scale() >= scale_before:
             lr_scheduler.step()
+        optimizer.zero_grad()
 
-        if i % args.save_every == 0:
+        if args.mem_profile_path is not None and i == 2:
+            torch.cuda.memory._dump_snapshot(str(args.mem_profile_path))
+            logger.info(
+                "dumped the memory profile after one forward pass",
+                out_path=args.mem_profile_path,
+            )
+            return
+
+        if args.mem_profile_path is None and i > 0 and i % args.save_every == 0:
             logger.info("running validation", step=i)
             start_time = time.perf_counter()
             model.eval()
             val_loss: float = 0.0
-            with torch.inference_mode():
+            with (
+                torch.inference_mode(),
+                torch.autocast(device, dtype=torch.float16, enabled=use_fp16),
+            ):
                 for b in tqdm.tqdm(test_dataloader, desc="running eval"):
-                    loss = get_loss(b)
-                    val_loss += float(loss.item())
+                    x, targets = b[0].to(device, non_blocking=True), b[1].to(
+                        device, non_blocking=True
+                    )
+
+                    val_loss += float(chunked_loss(x, targets, is_train=False).item())
             val_time = time.perf_counter() - start_time
 
             writer.add_scalar("val/loss", val_loss / len(test_dataloader), i)
