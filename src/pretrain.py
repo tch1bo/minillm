@@ -4,13 +4,13 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, assert_never, cast
+from typing import Literal, Self, assert_never, cast
 
 import numpy as np
 import tiktoken
 import torch
 import tqdm
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from torch.nn.functional import cross_entropy
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.checkpoint import checkpoint
@@ -32,7 +32,7 @@ class PreTrainArgs(BaseModel):
     seed: int = 42
     num_proc: int = Field(default_factory=multiprocessing.cpu_count)
     tokenizer_name: str = "gpt2"
-    train_batch_size: int = 64
+    train_batch_size: int = 16
     eval_batch_size: int = 64
     model_cfg: ModelConfig = Field(default_factory=ModelConfig)
     max_lr: float = 3e-4
@@ -43,7 +43,7 @@ class PreTrainArgs(BaseModel):
             f"/tmp/minillm/pretrain_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
         )
     )
-    save_every: int = 10000
+    save_every: int = 1000
     lr_warmup_ratio: float = 0.1
     mem_profile_path: Path | None = Field(
         default=None,
@@ -54,12 +54,34 @@ class PreTrainArgs(BaseModel):
         default=8,
         description="The number of chunks to split the logits into for computing the cross entropy",
     )
+    gradient_acc: int = Field(
+        default=32,
+        description="the number of batches to accumulate for a gradient update",
+    )
 
     def cli_cmd(self) -> None:
         pre_train(self)
 
     def get_tokenizer(self) -> tiktoken.Encoding:
         return tiktoken.get_encoding(self.tokenizer_name)
+
+    @model_validator(mode="after")
+    def validate_profiler(self) -> Self:
+        if self.mem_profile_path is not None:
+            logger.warning(
+                "setting --gradient_acc to 1, because memory profiling is enabled"
+            )
+            self.gradient_acc = 1
+        return self
+
+    def dataset_path(self) -> Path:
+        return self.dataset_dir / f"{self.dataset}-{self.tokenizer_name}"
+
+    def train_bin_path(self) -> Path:
+        return self.dataset_path() / "train.bin"
+
+    def test_bin_path(self) -> Path:
+        return self.dataset_path() / "test.bin"
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -80,13 +102,13 @@ class TokenizedDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def from_docs(
-        args: PreTrainArgs, ds: datasets.Dataset, mmap_file_name: str
+        args: PreTrainArgs, ds: datasets.Dataset, mmap_path: Path
     ) -> "TokenizedDataset":
         tokenizer = args.get_tokenizer()
         logger.info(f"tokenizing", num_strings=len(ds))
 
         def tokenize(batch) -> dict:
-            token_ids = tokenizer.encode_batch(batch["text"])
+            token_ids = tokenizer.encode_batch(batch["text"], disallowed_special=())
             for t in token_ids:
                 t.append(tokenizer.eot_token)
             return {"token_ids": token_ids, "len": [len(ts) for ts in token_ids]}
@@ -100,11 +122,11 @@ class TokenizedDataset(torch.utils.data.Dataset):
             # keep_in_memory=True,
         )
 
-        out_path = args.dataset_dir / mmap_file_name
-        logger.info("concatting tokens and mmaping the dataset", mmap_path=out_path)
+        logger.info("concatting tokens and mmaping the dataset", mmap_path=mmap_path)
+        mmap_path.parent.mkdir(exist_ok=True, parents=True)
         total = int(np.sum(tokenized["len"], dtype=np.uint64))
         data = np.memmap(
-            out_path,
+            mmap_path,
             dtype=np.uint32,
             mode="w+",
             shape=(total,),
@@ -122,24 +144,19 @@ class TokenizedDataset(torch.utils.data.Dataset):
 
 
 def load_data(args: PreTrainArgs) -> tuple[TokenizedDataset, TokenizedDataset]:
-    if args.dataset_dir.is_dir():
-        logger.info("loading pretokenized datasets", directory=args.dataset_dir)
+    train_path, test_path = args.train_bin_path(), args.test_bin_path()
+    if train_path.is_file() and test_path.is_file():
+        logger.info("loading pretokenized datasets", train=train_path, test=test_path)
         return (
             TokenizedDataset(
-                tokens=np.memmap(
-                    args.dataset_dir / "train.bin", dtype=np.uint32, mode="r"
-                ),
+                tokens=np.memmap(train_path, dtype=np.uint32, mode="r"),
                 max_len=args.model_cfg.max_len,
             ),
             TokenizedDataset(
-                tokens=np.memmap(
-                    args.dataset_dir / "test.bin", dtype=np.uint32, mode="r"
-                ),
+                tokens=np.memmap(test_path, dtype=np.uint32, mode="r"),
                 max_len=args.model_cfg.max_len,
             ),
         )
-    else:
-        args.dataset_dir.mkdir(parents=True)
 
     # use name="sample-10BT" to use the 10BT sample
     match args.dataset:
@@ -165,8 +182,8 @@ def load_data(args: PreTrainArgs) -> tuple[TokenizedDataset, TokenizedDataset]:
             assert_never(args.dataset)
 
     return (
-        TokenizedDataset.from_docs(args, train, "train.bin"),
-        TokenizedDataset.from_docs(args, test, "test.bin"),
+        TokenizedDataset.from_docs(args, train, train_path),
+        TokenizedDataset.from_docs(args, test, test_path),
     )
 
 
@@ -217,7 +234,7 @@ def pre_train(args: PreTrainArgs) -> None:
         lr=args.max_lr,
         fused=True,
     )
-    total_steps = len(train_dataloader)
+    total_steps = len(train_dataloader) / args.gradient_acc
     warmup_steps = int(total_steps * args.lr_warmup_ratio)
 
     def lr_func(step: int) -> float:
@@ -236,7 +253,14 @@ def pre_train(args: PreTrainArgs) -> None:
     args.out_dir.mkdir(exist_ok=True, parents=True)
     (args.out_dir / "args.json").write_text(args.model_dump_json(indent=2))
     writer = SummaryWriter(log_dir=args.out_dir)
-    logger.info("starting training", out_dir=args.out_dir, use_fp16=use_fp16)
+    logger.info(
+        "starting training",
+        out_dir=args.out_dir,
+        use_fp16=use_fp16,
+        tokens_per_grad_update=args.train_batch_size
+        * args.gradient_acc
+        * args.model_cfg.max_len,
+    )
 
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
 
@@ -267,26 +291,36 @@ def pre_train(args: PreTrainArgs) -> None:
 
             return loss / targets.numel()
 
+    running_loss = torch.zeros((), device=device)
     for i, batch in enumerate(tqdm.tqdm(train_dataloader, desc=f"training")):
         model.train()
 
         x, targets = batch[0].to(device, non_blocking=True), batch[1].to(
             device, non_blocking=True
         )
-        loss = chunked_loss(x, targets, is_train=True)
+        loss = chunked_loss(x, targets, is_train=True) / args.gradient_acc
+        running_loss += loss.detach()
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scale_before = scaler.get_scale()
-        scaler.step(optimizer)
-        scaler.update()
+        should_run_eval = False
 
-        writer.add_scalar("train/loss", loss.item(), i)
-        writer.add_scalar("train/lr", lr_scheduler.get_last_lr()[0], i)
+        if (i + 1) % args.gradient_acc == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scale_before = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+            writer.add_scalar("train/loss", running_loss.item(), i)
+            writer.add_scalar("train/lr", lr_scheduler.get_last_lr()[0], i)
 
-        if scaler.get_scale() >= scale_before:
-            lr_scheduler.step()
-        optimizer.zero_grad()
+            if scaler.get_scale() >= scale_before:
+                lr_scheduler.step()
+            optimizer.zero_grad()
+            running_loss.zero_()
+
+            grad_update = (i + 1) // args.gradient_acc
+            should_run_eval = (
+                args.mem_profile_path is None and grad_update % args.save_every == 0
+            )
 
         if args.mem_profile_path is not None and i == 2:
             torch.cuda.memory._dump_snapshot(str(args.mem_profile_path))
@@ -296,7 +330,7 @@ def pre_train(args: PreTrainArgs) -> None:
             )
             return
 
-        if args.mem_profile_path is None and i > 0 and i % args.save_every == 0:
+        if should_run_eval:
             logger.info("running validation", step=i)
             start_time = time.perf_counter()
             model.eval()
