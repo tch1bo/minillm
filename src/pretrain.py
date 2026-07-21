@@ -28,19 +28,24 @@ logger = get_logger()
 
 class PreTrainArgs(BaseModel):
     dataset_dir: Path
-    dataset: Literal["tiny-stories", "fineweb-sample"] = "tiny-stories"
+    dataset: Literal["tiny-stories", "fineweb-sample"]
     seed: int = 42
     num_proc: int = Field(default_factory=multiprocessing.cpu_count)
     tokenizer_name: str = "gpt2"
-    train_batch_size: int = 16
-    eval_batch_size: int = 64
+    train_batch_size: int = 15
+    eval_batch_size: int = 48
+    num_eval_batches: int = Field(
+        default=0,
+        description="the max number of batches from the eval dataset to run validation on. "
+        "If non-positive, all batches will be used",
+    )
     model_cfg: ModelConfig = Field(default_factory=ModelConfig)
     max_lr: float = 3e-4
     min_lr: float = 3e-5
     weight_decay: float = 0.1
     out_dir: Path = Field(
         default_factory=lambda: Path(
-            f"/tmp/minillm/pretrain_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+            f"./out/pretrain_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
         )
     )
     save_every: int = 1000
@@ -57,6 +62,10 @@ class PreTrainArgs(BaseModel):
     gradient_acc: int = Field(
         default=32,
         description="the number of batches to accumulate for a gradient update",
+    )
+    max_checkpoints: int = Field(
+        default=10,
+        description="the max number of checkpoints to save. If non-positive, all checkpoints will be saved",
     )
 
     def cli_cmd(self) -> None:
@@ -99,6 +108,12 @@ class TokenizedDataset(torch.utils.data.Dataset):
             self.tokens[start + 1 : start + self.max_len + 1], dtype=torch.long
         )
         return x, y
+
+    def prefix(self, num_tokens: int) -> "TokenizedDataset":
+        if num_tokens <= 0:
+            return self
+
+        return TokenizedDataset(tokens=self.tokens[:num_tokens], max_len=self.max_len)
 
     @staticmethod
     def from_docs(
@@ -187,9 +202,31 @@ def load_data(args: PreTrainArgs) -> tuple[TokenizedDataset, TokenizedDataset]:
     )
 
 
+def save_checkpoint(args: PreTrainArgs, state: dict, step: int) -> None:
+    out_path = args.out_dir / f"checkpoint_{step:08d}.pt"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp_path = out_path.with_suffix(".tmp")
+    torch.save(state, tmp_path)
+    tmp_path.rename(out_path)
+    logger.info("saved checkpoint", out_path=out_path)
+
+    if args.max_checkpoints >= 0:
+        checkpoints = sorted(out_path.parent.glob("checkpoint_*.pt"))
+        for old in checkpoints[: -args.max_checkpoints]:
+            logger.info("deleted old checkpoint", path=old)
+            old.unlink()
+
+
 def pre_train(args: PreTrainArgs) -> None:
     torch.manual_seed(args.seed)
     train, test = load_data(args)
+    if args.num_eval_batches > 0:
+        num_tokens = (
+            args.num_eval_batches * args.eval_batch_size + 1
+        ) * args.model_cfg.max_len
+        test = test.prefix(num_tokens)
+        logger.info("reduced the eval dataset", num_eval_tokens=num_tokens)
     logger.info("dataset loaded", train_samples=len(train), test_samples=len(test))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -292,7 +329,7 @@ def pre_train(args: PreTrainArgs) -> None:
             return loss / targets.numel()
 
     running_loss = torch.zeros((), device=device)
-    for i, batch in enumerate(tqdm.tqdm(train_dataloader, desc=f"training")):
+    for step, batch in enumerate(tqdm.tqdm(train_dataloader, desc=f"training")):
         model.train()
 
         x, targets = batch[0].to(device, non_blocking=True), batch[1].to(
@@ -303,26 +340,26 @@ def pre_train(args: PreTrainArgs) -> None:
         scaler.scale(loss).backward()
         should_run_eval = False
 
-        if (i + 1) % args.gradient_acc == 0:
+        if (step + 1) % args.gradient_acc == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            writer.add_scalar("train/loss", running_loss.item(), i)
-            writer.add_scalar("train/lr", lr_scheduler.get_last_lr()[0], i)
+            writer.add_scalar("train/loss", running_loss.item(), step)
+            writer.add_scalar("train/lr", lr_scheduler.get_last_lr()[0], step)
 
             if scaler.get_scale() >= scale_before:
                 lr_scheduler.step()
             optimizer.zero_grad()
             running_loss.zero_()
 
-            grad_update = (i + 1) // args.gradient_acc
+            grad_update = (step + 1) // args.gradient_acc
             should_run_eval = (
                 args.mem_profile_path is None and grad_update % args.save_every == 0
             )
 
-        if args.mem_profile_path is not None and i == 2:
+        if args.mem_profile_path is not None and step == 2:
             torch.cuda.memory._dump_snapshot(str(args.mem_profile_path))
             logger.info(
                 "dumped the memory profile after one forward pass",
@@ -331,7 +368,7 @@ def pre_train(args: PreTrainArgs) -> None:
             return
 
         if should_run_eval:
-            logger.info("running validation", step=i)
+            logger.info("running validation", step=step)
             start_time = time.perf_counter()
             model.eval()
             val_loss: float = 0.0
@@ -346,20 +383,18 @@ def pre_train(args: PreTrainArgs) -> None:
 
                     val_loss += float(chunked_loss(x, targets, is_train=False).item())
             val_time = time.perf_counter() - start_time
+            logger.info("finished validation", val_time=f"{val_time:.4f}s")
 
-            writer.add_scalar("val/loss", val_loss / len(test_dataloader), i)
+            writer.add_scalar("val/loss", val_loss / len(test_dataloader), step)
             writer.flush()
-            out_path = args.out_dir / f"checkpoint_{i}.pt"
-            torch.save(
+            save_checkpoint(
+                args,
                 {
-                    "step": i,
+                    "step": step,
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": lr_scheduler.state_dict(),
                     "scaler": scaler.state_dict(),
                 },
-                out_path,
-            )
-            logger.info(
-                "saved checkpoint", out_path=out_path, val_duration=f"{val_time:.4f}s"
+                step,
             )

@@ -11,3 +11,6 @@ wheels/
 
 # The pre-processed datasets
 datasets
+
+# The model checkpoints
+out
