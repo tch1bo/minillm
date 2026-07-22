@@ -1,10 +1,12 @@
 from pydantic_settings import BaseSettings, CliApp, CliSubCommand
 
+from src.infer import InferArgs
 from src.pretrain import PreTrainArgs
 
 
 class CliArgs(BaseSettings):
     pretrain: CliSubCommand[PreTrainArgs]
+    infer: CliSubCommand[InferArgs]
 
     def cli_cmd(self) -> None:
         CliApp.run_subcommand(self)

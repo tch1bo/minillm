@@ -12,7 +12,8 @@ import torch
 import tqdm
 from pydantic import BaseModel, Field, model_validator
 from torch.nn.functional import cross_entropy
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -202,11 +203,27 @@ def load_data(args: PreTrainArgs) -> tuple[TokenizedDataset, TokenizedDataset]:
     )
 
 
-def save_checkpoint(args: PreTrainArgs, state: dict, step: int) -> None:
+def save_checkpoint(
+    args: PreTrainArgs,
+    model: Model,
+    optimizer: Optimizer,
+    scheduler: LRScheduler,
+    scaler: torch.GradScaler,
+    step: int,
+) -> None:
     out_path = args.out_dir / f"checkpoint_{step:08d}.pt"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     tmp_path = out_path.with_suffix(".tmp")
+    state = (
+        {
+            "step": step,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
+        },
+    )
     torch.save(state, tmp_path)
     tmp_path.rename(out_path)
     logger.info("saved checkpoint", out_path=out_path)
@@ -389,12 +406,18 @@ def pre_train(args: PreTrainArgs) -> None:
             writer.flush()
             save_checkpoint(
                 args,
-                {
-                    "step": step,
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": lr_scheduler.state_dict(),
-                    "scaler": scaler.state_dict(),
-                },
+                model,
+                optimizer,
+                lr_scheduler,
+                scaler,
                 step,
             )
+
+        save_checkpoint(
+            args,
+            model,
+            optimizer,
+            lr_scheduler,
+            scaler,
+            step,
+        )

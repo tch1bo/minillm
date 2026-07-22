@@ -1,4 +1,5 @@
 import math
+from pathlib import Path
 from typing import Self, cast
 
 import pydantic
@@ -112,7 +113,9 @@ class Attention(Module):
         # (this allowed increasing the batch size from 4 to 10).
         # NOTE(2): An annoying part is that the EFFICIENT_ATTENTION backend
         # doesn't support the `enable_gqa` flag, so we have to repeat the k/v tensors.
-        with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+        with sdpa_kernel(
+            [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH], set_priority=True
+        ):
             k = k.repeat_interleave(self.Q.shape[0] // (2 * self.KV.shape[0]), dim=1)
             v = v.repeat_interleave(self.Q.shape[0] // (2 * self.KV.shape[0]), dim=1)
             # z is (b, head, token, attention_dim)
@@ -170,8 +173,7 @@ class Model(Module):
         residual_std = std / math.sqrt(2 * len(self.blocks))
 
         torch.nn.init.normal_(self.embedding.weight, std=std)
-        self.lm_head.weight = self.embedding.weight  # weight tying
-        # (if not tying: torch.nn.init.normal_(self.lm_head.weight, std=std))
+        torch.nn.init.normal_(self.lm_head.weight, std=std)
 
         for block in self.blocks:
             block = cast(Block, block)
@@ -192,6 +194,17 @@ class Model(Module):
         # TODO(chibo): KV-cache for inference?
         y = self.forward_no_lm_head(x)
         return self.lm_head(y)
+
+    @staticmethod
+    def load_from_file(
+        path: Path, cfg: Config, vocab_size: int, device: str
+    ) -> "Model":
+        m = Model(cfg, vocab_size)
+        d = torch.load(path, map_location=device)
+        if isinstance(d, dict) and "model" in d.keys():
+            d = d["model"]
+        m.load_state_dict(d)
+        return m
 
 
 def num_params(m: Module) -> int:
