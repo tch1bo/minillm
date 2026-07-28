@@ -1,19 +1,156 @@
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import tiktoken
 import torch
-from pydantic import BaseModel, Field
+import tqdm
+from pydantic import Field
 from pydantic_settings import CliPositionalArg
 
 from src.model import Config as ModelConfig
-from src.model import Model
+from src.model import Model, ModelLoadArgs
 from src.utils import get_logger
 
 logger = get_logger()
 
 
-class InferArgs(BaseModel):
+def _generate(
+    model: Model,
+    tokenizer: tiktoken.Encoding,
+    prompt: str | torch.Tensor,
+    num_samples: int,
+    max_total_len: int,
+    temperature: float | None,
+    top_p: float | None,
+    greedy: bool,
+    device: str,
+    use_fp16: bool,
+    use_tqdm: bool = False,
+) -> list[tuple[str, float]]:
+    # TODO(chibo): kv caching
+    model.eval()
+
+    if isinstance(prompt, str):
+        input_tokens = tokenizer.encode_ordinary(prompt)
+    else:
+        input_tokens = prompt.tolist()
+    ids = torch.tensor(input_tokens, dtype=torch.long, device=device)
+
+    # ids is (num_samples, len(input_tokens))
+    ids = ids.unsqueeze(0).repeat(num_samples, 1)
+    finished = torch.zeros(num_samples, dtype=torch.bool, device=device)
+    logprobs = torch.zeros(num_samples, dtype=torch.float32, device=device)
+    gen_lens = torch.zeros(num_samples, dtype=torch.long, device=device)
+
+    iterator: Any = range(len(input_tokens), max_total_len)
+    if use_tqdm:
+        iterator = tqdm.tqdm(iterator)
+
+    with (
+        torch.inference_mode(),
+        torch.autocast(device, dtype=torch.float16, enabled=use_fp16),
+    ):
+
+        for _ in iterator:
+            hidden = model.forward_no_lm_head(ids)
+            logits = model.lm_head(hidden[:, -1, :]).float()
+            model_logprobs = logits.log_softmax(dim=-1)
+
+            if temperature is not None:
+                logits = logits / temperature
+
+            if top_p is not None:
+                sorted_logits, sorted_indices = logits.sort(dim=-1, descending=True)
+                cs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+                mask = cs > top_p
+                mask[..., 1:] = mask[..., :-1].clone()
+                mask[..., 0] = False
+                sorted_logits[mask] = -float("inf")
+                logits = torch.gather(sorted_logits, 1, sorted_indices.argsort(-1))
+
+            probs = logits.softmax(dim=-1)
+            if greedy:
+                next_id = probs.argmax(dim=-1, keepdim=True)
+            else:
+                next_id = torch.multinomial(probs, num_samples=1)
+
+            # TODO(chibo): instead maybe stop predicting for the finished samples
+            next_id[finished] = tokenizer.eot_token
+            logprobs[~finished] += model_logprobs.gather(1, next_id).reshape(-1)[
+                ~finished
+            ]
+            gen_lens[~finished] += 1
+            ids = torch.cat([ids, next_id], dim=1)
+
+            finished |= next_id.squeeze(1) == tokenizer.eot_token
+            if finished.all():
+                break
+
+    def decode(row: torch.Tensor) -> str:
+        tokens = row[len(input_tokens) :].tolist()
+        if tokenizer.eot_token in tokens:
+            tokens = tokens[: tokens.index(tokenizer.eot_token)]
+        return tokenizer.decode(tokens)
+
+    mean_logprobs = logprobs / gen_lens.clamp(min=1)
+    list_logprobs = mean_logprobs.tolist()
+    return [(decode(row), p) for row, p in zip(ids, list_logprobs, strict=True)]
+
+
+def generate_top_p(
+    model: Model,
+    tokenizer: tiktoken.Encoding,
+    prompt: str | torch.Tensor,
+    num_samples: int,
+    max_total_len: int,
+    temperature: float,
+    top_p: float | None,
+    device: str,
+    use_fp16: bool,
+    use_tqdm: bool = False,
+) -> list[tuple[str, float]]:
+    return _generate(
+        model,
+        tokenizer,
+        prompt,
+        num_samples=num_samples,
+        max_total_len=max_total_len,
+        temperature=temperature,
+        top_p=top_p,
+        greedy=False,
+        device=device,
+        use_fp16=use_fp16,
+        use_tqdm=use_tqdm,
+    )
+
+
+def generate_greedy(
+    model: Model,
+    tokenizer: tiktoken.Encoding,
+    prompt: str | torch.Tensor,
+    max_total_len: int,
+    device: str,
+    use_fp16: bool,
+    use_tqdm: bool = False,
+) -> tuple[str, float]:
+    samples = _generate(
+        model,
+        tokenizer,
+        prompt,
+        num_samples=1,
+        max_total_len=max_total_len,
+        temperature=None,
+        top_p=None,
+        greedy=True,
+        device=device,
+        use_fp16=use_fp16,
+        use_tqdm=use_tqdm,
+    )
+    assert len(samples) == 1
+    return samples[0]
+
+
+class InferArgs(ModelLoadArgs):
     text: CliPositionalArg[str]
     model_path: Path
     max_tokens: int = 1000
@@ -26,14 +163,7 @@ class InferArgs(BaseModel):
 
 
 def infer(args: InferArgs) -> None:
-    tokenizer = tiktoken.get_encoding(args.tokenizer_name)
-    model = Model.load_from_file(
-        args.model_path,
-        args.model_cfg,
-        vocab_size=tokenizer.max_token_value + 1,
-        device=args.device,
-    )
-    model.eval()
+    model, tokenizer = args.load_model_and_tokenizer()
 
     tokens = tokenizer.encode(args.text)
     with torch.inference_mode():

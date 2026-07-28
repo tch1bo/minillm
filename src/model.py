@@ -1,11 +1,14 @@
 import math
 from pathlib import Path
-from typing import Self, cast
+from typing import Literal, Self, cast
 
 import pydantic
+import tiktoken
 import torch
 from torch.nn import Module, ModuleList
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.functional import cross_entropy
+from torch.utils.checkpoint import checkpoint
 
 from src.utils import get_logger
 
@@ -116,8 +119,8 @@ class Attention(Module):
         with sdpa_kernel(
             [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH], set_priority=True
         ):
-            k = k.repeat_interleave(self.Q.shape[0] // (2 * self.KV.shape[0]), dim=1)
-            v = v.repeat_interleave(self.Q.shape[0] // (2 * self.KV.shape[0]), dim=1)
+            k = k.repeat_interleave(self.Q.shape[0] // self.KV.shape[1], dim=1)
+            v = v.repeat_interleave(self.Q.shape[0] // self.KV.shape[1], dim=1)
             # z is (b, head, token, attention_dim)
             z = torch.nn.functional.scaled_dot_product_attention(
                 q,
@@ -200,12 +203,87 @@ class Model(Module):
         path: Path, cfg: Config, vocab_size: int, device: str
     ) -> "Model":
         m = Model(cfg, vocab_size)
-        d = torch.load(path, map_location=device)
+        d = torch.load(path, map_location="cpu")
         if isinstance(d, dict) and "model" in d.keys():
             d = d["model"]
+        d = {k.removeprefix("_orig_mod."): v for k, v in d.items()}
         m.load_state_dict(d)
-        return m
+        return m.to(device)
 
 
 def num_params(m: Module) -> int:
     return sum(p.numel() for p in m.parameters())
+
+
+class ModelLoadArgs(pydantic.BaseModel):
+    model_path: Path
+    tokenizer_name: str = "gpt2"
+    model_cfg: Config = pydantic.Field(default_factory=Config)
+    device: Literal["cuda", "cpu"] = "cuda"
+
+    def load_model_and_tokenizer(self) -> tuple[Model, tiktoken.Encoding]:
+        tokenizer = tiktoken.get_encoding(self.tokenizer_name)
+        model = Model.load_from_file(
+            self.model_path,
+            self.model_cfg,
+            vocab_size=tokenizer.max_token_value + 1,
+            device=self.device,
+        )
+        model.eval()
+        return (model, tokenizer)
+
+
+def adam_weight_decay(
+    model: Model, max_lr: float, weight_decay: float
+) -> torch.optim.AdamW:
+    return torch.optim.AdamW(
+        [
+            {
+                "params": [p for p in model.parameters() if p.dim() >= 2],
+                "weight_decay": weight_decay,
+            },
+            {
+                # Do not decay layer norms
+                "params": [p for p in model.parameters() if p.dim() < 2],
+                "weight_decay": 0.0,
+            },
+        ],
+        lr=max_lr,
+        fused=True,
+    )
+
+
+def chunked_cross_entropy_loss(
+    model: Model,
+    x: torch.Tensor,
+    targets: torch.Tensor,
+    num_ce_chunks: int,
+    *,
+    is_train: bool,
+    use_fp16: bool,
+) -> torch.Tensor:
+    # NOTE: the direct cross_entropy loss calculation was taking too much memory:
+    #   batch_size * len_size * vocab_size * (sizeof(fp32) + sizeof(fp16))
+    # which for a batch of 10 was around 3GB
+    # Splitting it into N chunks reduces the peak memory N times at a slightly higher compute
+    # cost (we have to recompute the `lm_head(hidden)` in the backward pass)
+    # This optimization allowed to increase the max batch size from 8 to 16 on my 12GB GPU
+    def _chunk_loss(h: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        logits = model.lm_head(h)
+        return cross_entropy(
+            logits.flatten(0, 1), t.flatten(), ignore_index=-100, reduction="sum"
+        )
+
+    with torch.autocast(x.device.type, dtype=torch.float16, enabled=use_fp16):
+        hidden = model.forward_no_lm_head(x)
+        loss = hidden.new_zeros((), dtype=torch.float32)
+        for h, t in zip(
+            hidden.chunk(num_ce_chunks, dim=1),
+            targets.chunk(num_ce_chunks, dim=1),
+        ):
+            if is_train:
+                loss = loss + checkpoint(_chunk_loss, h, t, use_reentrant=False)
+            else:
+                loss = loss + _chunk_loss(h, t)
+
+        return loss / targets.numel()

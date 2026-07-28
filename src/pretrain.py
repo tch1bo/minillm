@@ -1,4 +1,3 @@
-import math
 import multiprocessing
 import time
 from dataclasses import dataclass
@@ -11,24 +10,29 @@ import tiktoken
 import torch
 import tqdm
 from pydantic import BaseModel, Field, model_validator
-from torch.nn.functional import cross_entropy
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LambdaLR, LRScheduler
-from torch.utils.checkpoint import checkpoint
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 import datasets
 from datasets import Dataset, DatasetDict, load_dataset
-from src.model import Config as ModelConfig
-from src.model import Model, num_params
-from src.utils import get_logger
+from src.model import (
+    Config as ModelConfig,
+)
+from src.model import (
+    Model,
+    adam_weight_decay,
+    chunked_cross_entropy_loss,
+    num_params,
+)
+from src.utils import get_logger, make_cosine_scheduler, save_checkpoint
 
 logger = get_logger()
 
 
 class PreTrainArgs(BaseModel):
-    dataset_dir: Path
+    dataset_dir: Path = Path("./datasets")
+
     dataset: Literal["tiny-stories", "fineweb-sample"]
     seed: int = 42
     num_proc: int = Field(default_factory=multiprocessing.cpu_count)
@@ -203,40 +207,10 @@ def load_data(args: PreTrainArgs) -> tuple[TokenizedDataset, TokenizedDataset]:
     )
 
 
-def save_checkpoint(
-    args: PreTrainArgs,
-    model: Model,
-    optimizer: Optimizer,
-    scheduler: LRScheduler,
-    scaler: torch.GradScaler,
-    step: int,
-) -> None:
-    out_path = args.out_dir / f"checkpoint_{step:08d}.pt"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    tmp_path = out_path.with_suffix(".tmp")
-    state = (
-        {
-            "step": step,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "scaler": scaler.state_dict(),
-        },
-    )
-    torch.save(state, tmp_path)
-    tmp_path.rename(out_path)
-    logger.info("saved checkpoint", out_path=out_path)
-
-    if args.max_checkpoints >= 0:
-        checkpoints = sorted(out_path.parent.glob("checkpoint_*.pt"))
-        for old in checkpoints[: -args.max_checkpoints]:
-            logger.info("deleted old checkpoint", path=old)
-            old.unlink()
-
-
 def pre_train(args: PreTrainArgs) -> None:
     torch.manual_seed(args.seed)
+
+    # Load the data
     train, test = load_data(args)
     if args.num_eval_batches > 0:
         num_tokens = (
@@ -244,25 +218,6 @@ def pre_train(args: PreTrainArgs) -> None:
         ) * args.model_cfg.max_len
         test = test.prefix(num_tokens)
         logger.info("reduced the eval dataset", num_eval_tokens=num_tokens)
-    logger.info("dataset loaded", train_samples=len(train), test_samples=len(test))
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    use_fp16 = device == "cuda"
-
-    if args.mem_profile_path is not None:
-        torch.cuda.memory._record_memory_history(
-            enabled="all", context="all", stacks="python", max_entries=1000000
-        )
-
-    model = Model(ModelConfig(), vocab_size=args.get_tokenizer().max_token_value + 1)
-    model.init_weights()
-    model = model.to(device)
-    logger.info(
-        "model created",
-        num_params=num_params(model),
-        model=model,
-    )
-
     train_dataloader = DataLoader(
         train,
         batch_size=args.train_batch_size,
@@ -273,37 +228,39 @@ def pre_train(args: PreTrainArgs) -> None:
     test_dataloader = DataLoader(
         test, batch_size=args.eval_batch_size, drop_last=True, pin_memory=True
     )
-    optimizer = torch.optim.AdamW(
-        [
-            {
-                "params": [p for p in model.parameters() if p.dim() >= 2],
-                "weight_decay": args.weight_decay,
-            },
-            {
-                # Do not decay layer norms
-                "params": [p for p in model.parameters() if p.dim() < 2],
-                "weight_decay": 0.0,
-            },
-        ],
-        lr=args.max_lr,
-        fused=True,
+    logger.info("dataset loaded", train_samples=len(train), test_samples=len(test))
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    use_fp16 = device == "cuda"
+
+    if args.mem_profile_path is not None:
+        torch.cuda.memory._record_memory_history(
+            enabled="all", context="all", stacks="python", max_entries=1000000
+        )
+
+    # Init the model
+    model = Model(ModelConfig(), vocab_size=args.get_tokenizer().max_token_value + 1)
+    model.init_weights()
+    model = model.to(device)
+    logger.info(
+        "model created",
+        num_params=num_params(model),
+        model=model,
     )
-    total_steps = len(train_dataloader) / args.gradient_acc
-    warmup_steps = int(total_steps * args.lr_warmup_ratio)
 
-    def lr_func(step: int) -> float:
-        # NOTE: This needs to return a ratio of the max LR (and not the LR directly)
+    # Init the optimizer and the LR scheduler
+    optimizer = adam_weight_decay(model, args.max_lr, args.weight_decay)
+    lr_scheduler = LambdaLR(
+        optimizer,
+        make_cosine_scheduler(
+            total_steps=len(train_dataloader) // args.gradient_acc,
+            warmup_ratio=args.lr_warmup_ratio,
+            min_lr=args.min_lr,
+            max_lr=args.max_lr,
+        ),
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
 
-        if step < warmup_steps:
-            return (step + 1) / warmup_steps
-
-        min_ratio = args.min_lr / args.max_lr
-
-        r = (step - warmup_steps) / (total_steps - warmup_steps)
-        c = (1 + math.cos(r * math.pi)) / 2
-        return min_ratio + c * max(1 - min_ratio, 0)
-
-    lr_scheduler = LambdaLR(optimizer, lr_func)
     args.out_dir.mkdir(exist_ok=True, parents=True)
     (args.out_dir / "args.json").write_text(args.model_dump_json(indent=2))
     writer = SummaryWriter(log_dir=args.out_dir)
@@ -316,43 +273,19 @@ def pre_train(args: PreTrainArgs) -> None:
         * args.model_cfg.max_len,
     )
 
-    scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
-
-    def chunked_loss(
-        x: torch.Tensor, targets: torch.Tensor, is_train: bool
-    ) -> torch.Tensor:
-        # NOTE: the direct cross_entropy loss calculation was taking too much memory:
-        #   batch_size * len_size * vocab_size * (sizeof(fp32) + sizeof(fp16))
-        # which for a batch of 10 was around 3GB
-        # Splitting it into N chunks reduces the peak memory N times at a slightly higher compute
-        # cost (we have to recompute the `lm_head(hidden)` in the backward pass)
-        # This optimization allowed to increase the max batch size from 8 to 16 on my 12GB GPU
-        def _chunk_loss(h: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-            logits = model.lm_head(h)
-            return cross_entropy(logits.flatten(0, 1), t.flatten(), reduction="sum")
-
-        with torch.autocast(device, dtype=torch.float16, enabled=use_fp16):
-            hidden = model.forward_no_lm_head(x)
-            loss = hidden.new_zeros((), dtype=torch.float32)
-            for h, t in zip(
-                hidden.chunk(args.num_ce_chunks, dim=1),
-                targets.chunk(args.num_ce_chunks, dim=1),
-            ):
-                if is_train:
-                    loss = loss + checkpoint(_chunk_loss, h, t, use_reentrant=False)
-                else:
-                    loss = loss + _chunk_loss(h, t)
-
-            return loss / targets.numel()
-
     running_loss = torch.zeros((), device=device)
-    for step, batch in enumerate(tqdm.tqdm(train_dataloader, desc=f"training")):
+    for step, batch in enumerate(tqdm.tqdm(train_dataloader, desc="training")):
         model.train()
 
         x, targets = batch[0].to(device, non_blocking=True), batch[1].to(
             device, non_blocking=True
         )
-        loss = chunked_loss(x, targets, is_train=True) / args.gradient_acc
+        loss = (
+            chunked_cross_entropy_loss(
+                model, x, targets, args.num_ce_chunks, is_train=True, use_fp16=use_fp16
+            )
+            / args.gradient_acc
+        )
         running_loss += loss.detach()
         scaler.scale(loss).backward()
         should_run_eval = False
@@ -397,27 +330,38 @@ def pre_train(args: PreTrainArgs) -> None:
                     x, targets = b[0].to(device, non_blocking=True), b[1].to(
                         device, non_blocking=True
                     )
+                    loss = chunked_cross_entropy_loss(
+                        model,
+                        x,
+                        targets,
+                        args.num_ce_chunks,
+                        is_train=False,
+                        use_fp16=use_fp16,
+                    )
 
-                    val_loss += float(chunked_loss(x, targets, is_train=False).item())
+                    val_loss += float(loss.item())
             val_time = time.perf_counter() - start_time
             logger.info("finished validation", val_time=f"{val_time:.4f}s")
 
             writer.add_scalar("val/loss", val_loss / len(test_dataloader), step)
             writer.flush()
             save_checkpoint(
-                args,
+                args.out_dir,
                 model,
                 optimizer,
                 lr_scheduler,
                 scaler,
-                step,
+                step=step,
+                max_checkpoints=args.max_checkpoints,
             )
 
-        save_checkpoint(
-            args,
-            model,
-            optimizer,
-            lr_scheduler,
-            scaler,
-            step,
-        )
+    save_checkpoint(
+        args.out_dir,
+        model,
+        optimizer,
+        lr_scheduler,
+        scaler,
+        step=len(train_dataloader),
+        max_checkpoints=args.max_checkpoints,
+    )
+    writer.close()

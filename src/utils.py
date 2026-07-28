@@ -1,6 +1,10 @@
 import datetime
+import math
+from pathlib import Path
+from typing import Callable
 
 import structlog
+import torch
 from tqdm import tqdm
 
 
@@ -37,3 +41,57 @@ structlog.configure(
 
 def get_logger(**kwargs: object) -> structlog.stdlib.BoundLogger:
     return structlog.get_logger(**kwargs)
+
+
+logger = get_logger()
+
+
+def make_cosine_scheduler(
+    *, total_steps: int, warmup_ratio: float, min_lr: float, max_lr: float
+) -> Callable[[int], float]:
+    def cosine_lr(step: int) -> float:
+        warmup_steps = int(total_steps * warmup_ratio)
+        # NOTE: This needs to return a ratio of the max LR (and not the LR directly)
+
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+
+        min_ratio = min_lr / max_lr
+
+        r = (step - warmup_steps) / (total_steps - warmup_steps)
+        c = (1 + math.cos(r * math.pi)) / 2
+        return min_ratio + c * max(1 - min_ratio, 0)
+
+    return cosine_lr
+
+
+def save_checkpoint(
+    out_dir: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scaler: torch.GradScaler,
+    *,
+    step: int,
+    max_checkpoints: int,
+) -> None:
+    out_path = out_dir / f"checkpoint_{step:08d}.pt"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp_path = out_path.with_suffix(".tmp")
+    state = {
+        "step": step,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+    }
+    torch.save(state, tmp_path)
+    tmp_path.rename(out_path)
+    logger.info("saved checkpoint", out_path=out_path)
+
+    if max_checkpoints >= 0:
+        checkpoints = sorted(out_path.parent.glob("checkpoint_*.pt"))
+        for old in checkpoints[:-max_checkpoints]:
+            logger.info("deleted old checkpoint", path=old)
+            old.unlink()
