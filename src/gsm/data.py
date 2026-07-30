@@ -7,16 +7,25 @@ import torch
 from torch.utils.data import DataLoader
 
 import datasets
+from src.model import SEPARATOR
 from src.utils import get_logger
 
 logger = get_logger()
 
-SEPARATOR = "\n####\n"
 
+class Gsm8kBatch(NamedTuple):
+    # (batch_size, padded_length)
+    input_ids: torch.Tensor
 
-class Gsm8kSample(NamedTuple):
-    input_ids: torch.Tensor  # a 1d vector of tokens
-    answer: int
+    # (batch_size, padded_length), a matrix of booleans, True means the token is a padding token
+    # the samples in the batch are left-padded
+    pad_mask: torch.Tensor
+
+    # (batch_size), a vector of integers, contains the parsed answer to the math problem
+    answers: torch.Tensor
+
+    def __len__(self) -> int:
+        return self.answers.shape[0]
 
 
 @dataclass
@@ -24,25 +33,41 @@ class Gsm8kCollator:
     tokenizer: tiktoken.Encoding
     sep: list[int]
 
-    def __call__(self, batch: list[dict]) -> Gsm8kSample:
-        # NOTE: This collator currently works only with batches of size 1
-        # This is done to avoid implementing left-side padding and support
-        # of attention masks in the model.
-        assert len(batch) == 1
-        q = batch[0]["question"]
-        tokens = self.tokenizer.encode_ordinary(q) + self.sep
+    def __call__(self, batch: list[dict]) -> Gsm8kBatch:
+        tokens = [
+            t + self.sep
+            for t in self.tokenizer.encode_ordinary_batch(
+                [ex["question"] for ex in batch]
+            )
+        ]
 
-        input_ids = torch.tensor(tokens, dtype=torch.long)
+        # shape is (batch_size, max_len_in_batch)
+        shape = (len(tokens), max(len(t) for t in tokens))
+        input_ids = torch.full(shape, self.tokenizer.eot_token, dtype=torch.long)
+        pad_mask = torch.full(shape, True, dtype=torch.bool)
 
-        # gsm8k uses "," as thousands seprators (e.g. the answer can be "1,080")
-        answer = int(
-            batch[0]["answer"].rsplit("#### ", maxsplit=1)[-1].replace(",", "")
+        for i, t in enumerate(tokens):
+            input_ids[i, -len(t) :] = torch.tensor(t, dtype=torch.long)
+            pad_mask[i, -len(t) :] = False
+
+        answers = torch.tensor(
+            [
+                # gsm8k uses "," as thousands seprators (e.g. the answer can be "1,080")
+                int(ex["answer"].rsplit("#### ", maxsplit=1)[-1].replace(",", ""))
+                for ex in batch
+            ]
         )
-        return Gsm8kSample(input_ids=input_ids, answer=answer)
+        return Gsm8kBatch(
+            input_ids=input_ids,
+            pad_mask=pad_mask,
+            answers=answers,
+        )
 
 
 def load_gsm8k(
     tokenizer: tiktoken.Encoding,
+    train_batch_size: int,
+    test_batch_size: int,
     max_len: int,
 ) -> tuple[DataLoader, DataLoader]:
     gsm8k = datasets.load_dataset("openai/gsm8k", "main")
@@ -72,7 +97,7 @@ def load_gsm8k(
         )
         return DataLoader(
             cast(torch.utils.data.Dataset, filtered_ds),
-            batch_size=1,
+            batch_size=train_batch_size if is_train else test_batch_size,
             shuffle=is_train,
             collate_fn=Gsm8kCollator(tokenizer, sep),
             num_workers=4,

@@ -146,8 +146,11 @@ def run_tinygsm_sft(args: SftArgs) -> None:
         x, targets = batch.input_ids.to(device), batch.targets.to(device)
 
         with torch.autocast(x.device.type, dtype=torch.float16, enabled=use_fp16):
+            # We right-pad the batches for fine-tuning on TinyGSM, so technically there are padding
+            # tokens, but they don't really matter for the attention computation.
+            pad_mask = torch.zeros(x.shape, dtype=torch.bool, device=device)
             hidden = model.forward_no_lm_head(
-                x, input_pos=torch.arange(x.shape[1], device=device)
+                x, input_pos=torch.arange(x.shape[1], device=device), pad_mask=pad_mask
             )
             loss = (
                 chunked_cross_entropy_loss(

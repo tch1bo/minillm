@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Generator, Literal
+from typing import Any, Generator, Literal, NamedTuple
 
 import tiktoken
 import torch
@@ -8,8 +8,8 @@ import tqdm
 from pydantic import Field
 from pydantic_settings import CliPositionalArg
 
+from src.model import SEPARATOR, Model, ModelLoadArgs
 from src.model import Config as ModelConfig
-from src.model import Model, ModelLoadArgs
 from src.utils import get_logger
 
 logger = get_logger()
@@ -26,10 +26,16 @@ def kv_cache(
         model.delete_kv_cache()
 
 
+class Generation(NamedTuple):
+    output: str
+    prob: float
+
+
 def _generate(
     model: Model,
     tokenizer: tiktoken.Encoding,
-    prompt: str | torch.Tensor,
+    input_ids: torch.Tensor,
+    pad_mask: torch.Tensor,
     num_samples: int,
     max_total_len: int,
     temperature: float | None,
@@ -38,42 +44,47 @@ def _generate(
     device: str,
     use_fp16: bool,
     tqdm_desc: str | None = None,
-) -> list[tuple[str, float]]:
+) -> list[list[Generation]]:
     model.eval()
+    batch_size, start_num_tokens = input_ids.shape
+    input_ids = input_ids.to(device)
 
-    if isinstance(prompt, str):
-        input_tokens = tokenizer.encode_ordinary(prompt)
-    else:
-        input_tokens = prompt.tolist()
-    ids = torch.tensor(input_tokens, dtype=torch.long, device=device)
+    ids = input_ids.repeat_interleave(num_samples, dim=0)
+    pad_mask = pad_mask.repeat_interleave(num_samples, dim=0)
+    finished = torch.zeros(num_samples * batch_size, dtype=torch.bool, device=device)
+    logprobs = torch.zeros(num_samples * batch_size, dtype=torch.float32, device=device)
+    gen_lens = torch.zeros(num_samples * batch_size, dtype=torch.long, device=device)
 
-    # ids is (num_samples, len(input_tokens))
-    ids = ids.unsqueeze(0).repeat(num_samples, 1)
-    finished = torch.zeros(num_samples, dtype=torch.bool, device=device)
-    logprobs = torch.zeros(num_samples, dtype=torch.float32, device=device)
-    gen_lens = torch.zeros(num_samples, dtype=torch.long, device=device)
+    # preallocate the full pad mask once
+    full_pad_mask = torch.zeros(
+        (num_samples * batch_size, max_total_len), dtype=torch.bool, device=device
+    )
+    full_pad_mask[:, :start_num_tokens] = pad_mask
 
-    iterator: Any = range(len(input_tokens), max_total_len)
+    iterator: Any = range(start_num_tokens, max_total_len)
     if tqdm_desc:
         iterator = tqdm.tqdm(iterator, desc=tqdm_desc)
 
     with (
         torch.inference_mode(),
         torch.autocast(device, dtype=torch.float16, enabled=use_fp16),
-        kv_cache(model, num_samples, max_total_len, use_fp16),
+        kv_cache(model, batch_size * num_samples, max_total_len, use_fp16),
     ):
 
         for i in iterator:
-            if i == len(input_tokens):
+            if i == start_num_tokens:
                 # prefill the cache
                 hidden = model.forward_no_lm_head(
-                    ids, input_pos=torch.arange(len(input_tokens), device=device)
+                    ids,
+                    input_pos=torch.arange(start_num_tokens, device=device),
+                    pad_mask=full_pad_mask[:, :i],
                 )
             else:
                 # decode one token at a time
                 hidden = model.forward_no_lm_head(
                     ids[..., [i - 1]],
                     input_pos=torch.tensor([i - 1], device=device, dtype=torch.long),
+                    pad_mask=full_pad_mask[:, :i],
                 )
 
             logits = model.lm_head(hidden[:, -1, :]).float()
@@ -97,7 +108,8 @@ def _generate(
             else:
                 next_id = torch.multinomial(probs, num_samples=1)
 
-            # TODO(chibo): instead maybe stop predicting for the finished samples
+            # TODO(chibo): we can stop predicting for sequences that are already finished, but that
+            # will require some additional bookkeeping
             next_id[finished] = tokenizer.eot_token
             logprobs[~finished] += model_logprobs.gather(1, next_id).reshape(-1)[
                 ~finished
@@ -110,20 +122,35 @@ def _generate(
                 break
 
     def decode(row: torch.Tensor) -> str:
-        tokens = row[len(input_tokens) :].tolist()
+        tokens = row.reshape(-1)[start_num_tokens:].tolist()
         if tokenizer.eot_token in tokens:
             tokens = tokens[: tokens.index(tokenizer.eot_token)]
         return tokenizer.decode(tokens)
 
     mean_logprobs = logprobs / gen_lens.clamp(min=1)
-    list_probs = mean_logprobs.exp().tolist()
-    return [(decode(row), p) for row, p in zip(ids, list_probs, strict=True)]
+    final_probs = mean_logprobs.exp()
+
+    def decode_sample(
+        ids_chunk: torch.Tensor, probs_chunk: torch.Tensor
+    ) -> list[Generation]:
+        return [
+            Generation(output=decode(row), prob=p)
+            for row, p in zip(ids_chunk, probs_chunk.tolist(), strict=True)
+        ]
+
+    return [
+        decode_sample(ic, pc)
+        for ic, pc in zip(
+            ids.chunk(batch_size), final_probs.chunk(batch_size), strict=True
+        )
+    ]
 
 
 def generate_top_p(
     model: Model,
     tokenizer: tiktoken.Encoding,
-    prompt: str | torch.Tensor,
+    input_ids: torch.Tensor,
+    pad_mask: torch.Tensor,
     num_samples: int,
     max_total_len: int,
     temperature: float,
@@ -131,11 +158,12 @@ def generate_top_p(
     device: str,
     use_fp16: bool,
     tqdm_desc: str | None = None,
-) -> list[tuple[str, float]]:
-    return _generate(
+) -> list[list[Generation]]:
+    result = _generate(
         model,
         tokenizer,
-        prompt,
+        input_ids,
+        pad_mask,
         num_samples=num_samples,
         max_total_len=max_total_len,
         temperature=temperature,
@@ -145,21 +173,27 @@ def generate_top_p(
         use_fp16=use_fp16,
         tqdm_desc=tqdm_desc,
     )
+    # Sort the responses in decreasing order of probability.
+    for i, r in enumerate(result):
+        result[i] = sorted(r, key=lambda t: t[1], reverse=True)
+    return result
 
 
 def generate_greedy(
     model: Model,
     tokenizer: tiktoken.Encoding,
-    prompt: str | torch.Tensor,
+    input_ids: torch.Tensor,
+    pad_mask: torch.Tensor,
     max_total_len: int,
     device: str,
     use_fp16: bool,
     tqdm_desc: str | None = None,
-) -> tuple[str, float]:
+) -> list[Generation]:
     samples = _generate(
         model,
         tokenizer,
-        prompt,
+        input_ids,
+        pad_mask,
         num_samples=1,
         max_total_len=max_total_len,
         temperature=None,
@@ -169,38 +203,64 @@ def generate_greedy(
         use_fp16=use_fp16,
         tqdm_desc=tqdm_desc,
     )
-    assert len(samples) == 1
-    return samples[0]
+    for s in samples:
+        assert len(s) == 1
+    return [s[0] for s in samples]
 
 
 class InferArgs(ModelLoadArgs):
     text: CliPositionalArg[str]
     model_path: Path
-    max_tokens: int = 1000
+    num_samples: int | None = Field(
+        default=None,
+        description="None means greedy decoding. An int means top_p sampling with temperature",
+    )
+    max_tokens: int | None = None
     tokenizer_name: str = "gpt2"
     model_cfg: ModelConfig = Field(default_factory=ModelConfig)
     device: Literal["cuda", "cpu"] = "cpu"
+    temp: float = 0.7
+    top_p: float = 0.95
 
     def cli_cmd(self) -> None:
         infer(self)
 
 
 def infer(args: InferArgs) -> None:
-    # TODO(chibo): change this
     model, tokenizer = args.load_model_and_tokenizer()
 
-    tokens = tokenizer.encode(args.text)
-    with torch.inference_mode():
-        while len(tokens) < args.max_tokens:
-            t = torch.tensor(tokens).reshape((1, -1))
-            logits = model.forward(t)[0, -1]
-            print(logits.shape)
-            smax = logits.softmax(dim=-1)
-            top_tokens = smax.argsort(descending=True)[:5]
-            print(
-                "top 5 tokens: ",
-                [(tokenizer.decode([int(t.item())]), smax[t]) for t in top_tokens],
-            )
-            next_token_id = int(top_tokens[0].item())
-            tokens.append(next_token_id)
-            print(tokenizer.decode(tokens))
+    prompt = args.text + SEPARATOR
+    tokens = tokenizer.encode(prompt)
+    input_ids = torch.tensor([tokens], device=args.device)
+    pad_mask = torch.zeros_like(input_ids, dtype=torch.bool, device=args.device)
+    max_len = args.max_tokens if args.max_tokens is not None else args.model_cfg.max_len
+    if args.num_samples is None:
+        answers = generate_greedy(
+            model,
+            tokenizer,
+            input_ids,
+            pad_mask,
+            max_len,
+            args.device,
+            use_fp16=args.device == "cuda",
+            tqdm_desc="infering",
+        )
+    else:
+        answers = generate_top_p(
+            model,
+            tokenizer,
+            input_ids,
+            pad_mask,
+            args.num_samples,
+            max_len,
+            temperature=args.temp,
+            top_p=args.top_p,
+            device=args.device,
+            use_fp16=args.device == "cuda",
+            tqdm_desc="infering",
+        )[0]
+
+    for g in answers:
+        print(f"prob is: {g.prob}")
+        print(g.output)
+        print("=" * 120)

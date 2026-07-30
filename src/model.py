@@ -15,6 +15,10 @@ from src.utils import get_logger
 logger = get_logger()
 
 
+# This is used as the separator between the prompt and the response.
+SEPARATOR = "\n####\n"
+
+
 class Config(pydantic.BaseModel):
     num_blocks: int = 12
     model_dim: int = 768
@@ -99,7 +103,9 @@ class Attention(Module):
         self.register_buffer("_k_cache", None, persistent=False)
         self.register_buffer("_v_cache", None, persistent=False)
 
-    def forward(self, x: torch.Tensor, input_pos: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, input_pos: torch.Tensor, pad_mask: torch.Tensor
+    ) -> torch.Tensor:
         # x is (batch, token, model_dim)
         batch_size, num_tokens, model_dim = x.shape
 
@@ -117,15 +123,12 @@ class Attention(Module):
 
         # NOTE: The EFFICIENT_ATTENTION backend (see the usage below)
         # doesn't support the `enable_gqa` flag, so we have to repeat the k/v tensors.
+        # TODO(chibo): can I do some view-magic instead of repeat_interleave?
         k = k.repeat_interleave(self.Q.shape[0] // self.KV.shape[1], dim=1)
         v = v.repeat_interleave(self.Q.shape[0] // self.KV.shape[1], dim=1)
 
-        use_kv_cache = self._k_cache is not None and self._v_cache is not None
-        if use_kv_cache:
-            # silence the type-checker
-            assert self._k_cache is not None
-            assert self._v_cache is not None
-
+        if self._k_cache is not None and self._v_cache is not None:
+            # Use the kv-cache
             self._k_cache.index_copy_(2, input_pos, k)
             self._v_cache.index_copy_(2, input_pos, v)
 
@@ -133,15 +136,29 @@ class Attention(Module):
             k = self._k_cache[:, :, : last_pos + 1]
             v = self._v_cache[:, :, : last_pos + 1]
 
-            # num_tokens == 1 - we're in a decoding loop
-            # num_tokens  > 1 - we're prefilling the cache
-            is_causal = num_tokens > 1
-            if is_causal:
-                assert (
-                    int(input_pos[0]) == 0
-                ), "multi-token cache prefill is supported only from the start of the sequence"
-        else:
-            is_causal = True
+        # the pad_mask is expected to be for the full sequence
+        assert pad_mask.shape == (batch_size, k.shape[2])
+
+        # attn_bias is (batch_size, target_tokens, source_tokens)
+        attn_bias = torch.zeros(
+            (batch_size, num_tokens, k.shape[2]), dtype=q.dtype, device=q.device
+        )
+        attn_bias.masked_fill_(pad_mask.unsqueeze(1), float("-inf"))
+        if num_tokens > 1:
+            # apply the causal mask
+            assert (
+                int(input_pos[0]) == 0
+            ), "multi-token cache prefill is supported only from the start of the sequence"
+            tril = torch.ones(
+                num_tokens, k.shape[2], dtype=torch.bool, device=q.device
+            ).tril(diagonal=0)
+            attn_bias.masked_fill_(tril.logical_not(), float("-inf"))
+
+            # This is a guard against left-padding. In that case, the first pad token in the sequence
+            # would have an all -inf attention row, which would lead to NaNs after softmax.
+            # We let the pad tokens attend to themselves and nothing else attends to them anyways.
+            diag = torch.arange(num_tokens, device=q.device)
+            attn_bias[:, diag, diag] = 0.0
 
         # Compute attention
         # NOTE: my GPU is from the older generation and FLASH_ATTENTION is not supported for it.
@@ -157,7 +174,9 @@ class Attention(Module):
                 q,
                 k,
                 v,
-                is_causal=is_causal,
+                # `attn_mask` should be brodcastable to (batch_size, num_heads, target_tokens, source_tokens)
+                # before the `unsqueeze` it is: (batch_size, target_tokens, source_tokens)
+                attn_mask=attn_bias.unsqueeze(1),
                 dropout_p=0,
                 enable_gqa=False,
             )
@@ -205,8 +224,10 @@ class Block(Module):
         self.ff_norm = torch.nn.RMSNorm([cfg.model_dim])
         self.ff = SWIGLU(cfg)
 
-    def forward(self, x: torch.Tensor, input_pos: torch.Tensor) -> torch.Tensor:
-        x = x + self.attention(self.attention_norm(x), input_pos)
+    def forward(
+        self, x: torch.Tensor, input_pos: torch.Tensor, pad_mask: torch.Tensor
+    ) -> torch.Tensor:
+        x = x + self.attention(self.attention_norm(x), input_pos, pad_mask)
         x = x + self.ff(self.ff_norm(x))
         return x
 
@@ -253,10 +274,13 @@ class Model(Module):
         # In principle, `input_pos` could simply be `start_pos: int`, but that doesn't play well
         # with `torch.compile`
         input_pos: torch.Tensor,
+        # pad_mask is a boolean tensor that indicates which of the tokens are padding tokens
+        # (True means "padding token", False - "real token")
+        pad_mask: torch.Tensor,
     ) -> torch.Tensor:
         y = self.embedding(x)
         for block in self.blocks:
-            y = block(y, input_pos)
+            y = block(y, input_pos, pad_mask)
 
         return self.final_rms_norm(y)
 

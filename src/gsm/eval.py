@@ -1,16 +1,17 @@
 import os
 import subprocess
 import tempfile
+from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import Sequence, cast
 
 import tiktoken
 import torch
 import tqdm
-from pydantic import BaseModel, RootModel
+from pydantic import BaseModel, Field, RootModel
 
-from src.gsm.data import Gsm8kSample, load_gsm8k
-from src.infer import generate_greedy, generate_top_p
+from src.gsm.data import Gsm8kBatch, load_gsm8k
+from src.infer import Generation, generate_greedy, generate_top_p
 from src.model import Model, ModelLoadArgs
 from src.utils import get_logger
 
@@ -22,9 +23,6 @@ class ExecutionResult(BaseModel):
     exception_str: str | None = None
     stdout: str | None = None
     answer: int | None = None
-
-    def is_correct(self, expected_answer: int) -> bool:
-        return self.answer is not None and self.answer == expected_answer
 
 
 def _run_one_sample(code: str, timeout: float = 1.0) -> ExecutionResult:
@@ -62,135 +60,157 @@ def _run_one_sample(code: str, timeout: float = 1.0) -> ExecutionResult:
         # The code samples in TinyGSM use / instead of //, so the model learns to use it as well.
         # To handle this, we first convert the result to float and then to an int.
         answer = int(float(result.stdout))
-    except ValueError as e:
+    except (ValueError, OverflowError) as e:
         return ExecutionResult(exception_str=str(e), stdout=result.stdout)
 
     return ExecutionResult(answer=answer)
 
 
-class GenerationResult(BaseModel):
-    code: str
-    prob: float
-    exec_result: ExecutionResult
-
-    def is_correct(self, expected_answer: int) -> bool:
-        return self.exec_result.is_correct(expected_answer)
+class GenerationAndExec(BaseModel):
+    g: Generation
+    e: ExecutionResult
 
 
-class SampleResult(BaseModel):
-    greedy: GenerationResult
-    top_p: list[GenerationResult]
-    expected_answer: int
+class Gsm8kGeneration(BaseModel):
+    # The ground truth answer
+    answer: int
 
-    def greedy_correct(self) -> bool:
-        return self.greedy.is_correct(self.expected_answer)
+    # The solutions generated using greedy sampling (size: batch_size)
+    # (if greedy sampling was not requested, is set to None)
+    greedy: GenerationAndExec | None
 
-    def any_top_p_correct(self) -> bool:
-        return any(r.is_correct(self.expected_answer) for r in self.top_p)
-
-    def ratio_top_p_correct(self) -> float:
-        return sum(int(r.is_correct(self.expected_answer)) for r in self.top_p) / len(
-            self.top_p
-        )
+    # The solutions generated using top_p sampling (size: (batch_size, num_samples))
+    # (if top_p sampling was not requested, the list will be empty)
+    top_p: list[GenerationAndExec]
 
 
-def eval_one_sample(
+def generate_for_batch(
     model: Model,
-    max_len: int,
+    args: EvalArgs,
     tokenizer: tiktoken.Encoding,
-    sample: Gsm8kSample,
+    batch: Gsm8kBatch,
     device: str,
     use_tqdm: bool = False,
-) -> SampleResult:
+) -> list[Gsm8kGeneration]:
     use_fp16 = device == "cuda"
-    greedy_code, greed_prob = generate_greedy(
-        model,
-        tokenizer,
-        sample.input_ids,
-        max_len,
-        device,
-        use_fp16=use_fp16,
-        tqdm_desc="greedy sampling" if use_tqdm else None,
-    )
-    greedy_eval = _run_one_sample(greedy_code)
 
-    top_p_codes = generate_top_p(
-        model,
-        tokenizer,
-        sample.input_ids,
-        32,
-        max_len,
-        temperature=0.7,
-        top_p=0.95,
-        device=device,
-        use_fp16=use_fp16,
-        tqdm_desc="top-p sampling" if use_tqdm else None,
-    )
-    top_p_codes = sorted(top_p_codes, key=lambda x: x[1], reverse=True)
-    top_p_evals = [_run_one_sample(c[0]) for c in top_p_codes]
+    greedy: Sequence[GenerationAndExec | None] = [None] * len(batch)
+    if args.eval_greedy:
+        gs = generate_greedy(
+            model,
+            tokenizer,
+            batch.input_ids,
+            batch.pad_mask,
+            args.model_cfg.max_len,
+            device,
+            use_fp16=use_fp16,
+            tqdm_desc="greedy sampling" if use_tqdm else None,
+        )
+        es = [_run_one_sample(g.output) for g in gs]
+        greedy = [GenerationAndExec(g=g, e=e) for (g, e) in zip(gs, es, strict=True)]
 
-    return SampleResult(
-        greedy=GenerationResult(
-            code=greedy_code, prob=greed_prob, exec_result=greedy_eval
-        ),
-        top_p=[
-            GenerationResult(code=c, prob=p, exec_result=er)
-            for ((c, p), er) in zip(top_p_codes, top_p_evals, strict=True)
-        ],
-        expected_answer=sample.answer,
-    )
+    top_p: list[list[GenerationAndExec]] = [[]] * len(batch)
+    if args.eval_top_p is not None:
+        gss = generate_top_p(
+            model,
+            tokenizer,
+            batch.input_ids,
+            batch.pad_mask,
+            args.eval_top_p,
+            args.model_cfg.max_len,
+            temperature=args.temp,
+            top_p=args.top_p,
+            device=device,
+            use_fp16=use_fp16,
+            tqdm_desc="top-p sampling" if use_tqdm else None,
+        )
+        ess = [[_run_one_sample(g.output) for g in gs] for gs in gss]
+        top_p = [
+            [GenerationAndExec(g=g, e=e) for (g, e) in zip(gs, es, strict=True)]
+            for (gs, es) in zip(gss, ess, strict=True)
+        ]
+
+    return [
+        Gsm8kGeneration(answer=a, greedy=g, top_p=p)
+        for (a, g, p) in zip(batch.answers.tolist(), greedy, top_p, strict=True)
+    ]
 
 
 class EvalArgs(ModelLoadArgs):
-    num_samples: int | None = None
-    out_dir: Path = Path("/tmp/gsm_eval")
+    num_batches: int | None = None
+    out_path: Path = Field(
+        default_factory=lambda: Path(
+            f"/tmp/gsm_eval_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.json"
+        )
+    )
     seed: int = 42
+    batch_size: int = 16
+    eval_greedy: bool = True
+    eval_top_p: int | None = Field(
+        default=None,
+        description="if None, no top_p samples will be generated. If not-None, will generate that many top_p samples",
+    )
+    top_p: float = 0.95
+    temp: float = 0.7
 
     def cli_cmd(self) -> None:
         run_eval(self)
+
+
+def print_stats(gs: list[Gsm8kGeneration], args: EvalArgs) -> None:
+    logger.info("eval results")
+    if args.eval_greedy:
+        ok = [g for g in gs if g.greedy and g.answer == g.greedy.e.answer]
+        logger.info("  greedy pass_1:", value=len(ok) / len(gs))
+
+    if args.eval_top_p is not None:
+        logger.info(
+            "  top_p", num_samples=args.eval_top_p, temp=args.temp, top_p=args.top_p
+        )
+        pass_1 = [g for g in gs if g.top_p and g.answer == g.top_p[0].e.answer]
+        logger.info("    top_p pass_1:", value=len(pass_1) / len(gs))
+
+        pass_n = [g for g in gs if any(g.answer == p.e.answer for p in g.top_p)]
+        logger.info("    top_p pass_n:", value=len(pass_n) / len(gs))
+
+        total_top_p_samples = sum([len(g.top_p) for g in gs])
+        num_pass = sum(sum(g.answer == p.e.answer for p in g.top_p) for g in gs)
+        logger.info("    top_p pass_rate:", value=num_pass / total_top_p_samples)
 
 
 def run_eval(args: EvalArgs) -> None:
     torch.manual_seed(args.seed)
     model, tokenizer = args.load_model_and_tokenizer()
 
-    _, test = load_gsm8k(tokenizer, args.model_cfg.max_len)
+    _, test = load_gsm8k(
+        tokenizer,
+        train_batch_size=1,
+        test_batch_size=args.batch_size,
+        max_len=args.model_cfg.max_len,
+    )
 
-    num_samples = args.num_samples if args.num_samples is not None else len(test)
+    num_batches = args.num_batches if args.num_batches is not None else len(test)
     logger.info(
         "evaluating on the gsm8k test split",
-        num_samples=num_samples,
-        out_dir=args.out_dir,
+        num_batches=num_batches,
+        out_path=args.out_path,
     )
-    results: list[SampleResult] = []
-    for i, sample in zip(tqdm.trange(num_samples), test):
-        sample = cast(Gsm8kSample, sample)
-        result = eval_one_sample(
-            model,
-            args.model_cfg.max_len,
-            tokenizer,
-            sample,
-            args.device,
-            use_tqdm=False,
+    generations: list[Gsm8kGeneration] = []
+    for i, batch in zip(tqdm.trange(num_batches, desc="generating the answers"), test):
+        generations.extend(
+            generate_for_batch(
+                model,
+                args,
+                tokenizer,
+                cast(Gsm8kBatch, batch),
+                args.device,
+                use_tqdm=False,
+            )
         )
-        out_path = args.out_dir / f"{i}.json"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(result.model_dump_json(indent=2))
-        results.append(result)
 
-    # TODO(chibo): split the generation and the evaluation
-    # TODO(chibo): batch the generation
-
-    all_out_path = args.out_dir / "all.json"
-    all_out_path.write_text(
-        RootModel[list[SampleResult]](results).model_dump_json(indent=2)
+    args.out_path.write_text(
+        RootModel[list[Gsm8kGeneration]](generations).model_dump_json(indent=2)
     )
-    logger.info("wrote all results", out_path=all_out_path)
+    logger.info("wrote all results", out_path=args.out_path)
 
-    greedy_pass_1 = sum(int(r.greedy_correct()) for r in results) / len(results)
-    pass_32 = sum(int(r.any_top_p_correct()) for r in results) / len(results)
-    pass_32_ratio = sum(r.ratio_top_p_correct() for r in results) / len(results)
-    logger.info("done evaluating")
-    logger.info("  greedy pass_1:", value=greedy_pass_1)
-    logger.info("  top_p pass_32:", value=pass_32)
-    logger.info("  top_p pass_32 ratio:", value=pass_32_ratio)
+    print_stats(generations, args)
