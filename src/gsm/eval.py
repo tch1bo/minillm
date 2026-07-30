@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import cast
 
 import tiktoken
+import torch
 import tqdm
 from pydantic import BaseModel, RootModel
 
@@ -143,12 +144,14 @@ def eval_one_sample(
 class EvalArgs(ModelLoadArgs):
     num_samples: int | None = None
     out_dir: Path = Path("/tmp/gsm_eval")
+    seed: int = 42
 
     def cli_cmd(self) -> None:
         run_eval(self)
 
 
 def run_eval(args: EvalArgs) -> None:
+    torch.manual_seed(args.seed)
     model, tokenizer = args.load_model_and_tokenizer()
 
     _, test = load_gsm8k(tokenizer, args.model_cfg.max_len)
@@ -168,12 +171,15 @@ def run_eval(args: EvalArgs) -> None:
             tokenizer,
             sample,
             args.device,
-            use_tqdm=True,
+            use_tqdm=False,
         )
         out_path = args.out_dir / f"{i}.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(result.model_dump_json(indent=2))
         results.append(result)
+
+    # TODO(chibo): split the generation and the evaluation
+    # TODO(chibo): batch the generation
 
     all_out_path = args.out_dir / "all.json"
     all_out_path.write_text(

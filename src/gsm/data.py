@@ -146,6 +146,7 @@ def load_tinygsm(
         ds_size_before=len(ds),
         ds_size_after=len(filtered_ds),
     )
+    # TODO(chibo): implement fast forwarding through the dataset
     return DataLoader(
         cast(torch.utils.data.Dataset, filtered_ds),
         batch_size=batch_size,

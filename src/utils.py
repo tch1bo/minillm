@@ -95,3 +95,23 @@ def save_checkpoint(
         for old in checkpoints[:-max_checkpoints]:
             logger.info("deleted old checkpoint", path=old)
             old.unlink()
+
+
+def restore_checkpoint(
+    path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scaler: torch.GradScaler,
+    device: str,
+) -> int:
+    state = torch.load(path, map_location=device, weights_only=True)
+
+    model.load_state_dict(state["model"])
+    optimizer.load_state_dict(state["optimizer"])
+    scheduler.load_state_dict(state["scheduler"])
+    scaler.load_state_dict(state["scaler"])
+
+    step = state["step"]
+    logger.info("restored checkpoint", path=path, step=step)
+    return step

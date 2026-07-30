@@ -1,6 +1,6 @@
 import math
 from pathlib import Path
-from typing import Literal, Self, cast
+from typing import Any, Literal, Mapping, Self, cast, override
 
 import pydantic
 import tiktoken
@@ -260,15 +260,23 @@ class Model(Module):
 
         return self.final_rms_norm(y)
 
+    @override
+    def load_state_dict(
+        self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
+    ) -> torch.nn.modules.module._IncompatibleKeys:
+        if "model" in state_dict.keys():
+            state_dict = state_dict["model"]
+        state_dict = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+        return super().load_state_dict(state_dict, strict, assign)
+
     @staticmethod
     def load_from_file(
         path: Path, cfg: Config, vocab_size: int, device: str
     ) -> "Model":
-        m = Model(cfg, vocab_size)
         d = torch.load(path, map_location="cpu")
-        if isinstance(d, dict) and "model" in d.keys():
+        m = Model(cfg, vocab_size)
+        if "model" in d.keys():
             d = d["model"]
-        d = {k.removeprefix("_orig_mod."): v for k, v in d.items()}
         m.load_state_dict(d)
         return m.to(device)
 

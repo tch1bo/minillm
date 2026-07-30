@@ -5,26 +5,35 @@ It uses the gsm8k/test split for testing.
 
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import Self, cast
 
+import tiktoken
 import torch
 import tqdm
-from pydantic import Field
+from pydantic import BaseModel, Field, model_validator
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 
 from src.gsm.data import TinyGsmBatch, load_tinygsm
 from src.model import (
-    ModelLoadArgs,
+    Config as ModelConfig,
+)
+from src.model import (
+    Model,
     adam_weight_decay,
     chunked_cross_entropy_loss,
 )
-from src.utils import get_logger, make_cosine_scheduler, save_checkpoint
+from src.utils import (
+    get_logger,
+    make_cosine_scheduler,
+    restore_checkpoint,
+    save_checkpoint,
+)
 
 logger = get_logger()
 
 
-class SftArgs(ModelLoadArgs):
+class SftArgs(BaseModel):
     seed: int = 42
     tokenizer_name: str = "gpt2"
     train_batch_size: int = 12
@@ -52,24 +61,41 @@ class SftArgs(ModelLoadArgs):
         default=10,
         description="the max number of checkpoints to save. If non-positive, all checkpoints will be saved",
     )
+    resume_from_checkpoint: Path | None = None
+    pretrained_model_path: Path | None = None
+    model_cfg: ModelConfig = Field(default_factory=ModelConfig)
 
     def cli_cmd(self) -> None:
         run_tinygsm_sft(self)
 
+    @model_validator(mode="after")
+    def validate_paths(self) -> Self:
+        if self.resume_from_checkpoint is None:
+            if self.pretrained_model_path is None:
+                raise ValueError(
+                    "either --resume_from_checkpoint or --pretrained_model_path must be provided"
+                )
+            return self
+
+        self.out_dir = self.resume_from_checkpoint.parent
+        return self
+
 
 def run_tinygsm_sft(args: SftArgs) -> None:
     torch.manual_seed(args.seed)
-
-    # Load the model
-    model, tokenizer = args.load_model_and_tokenizer()
+    args.out_dir.mkdir(exist_ok=True, parents=True)
+    (args.out_dir / "args.json").write_text(args.model_dump_json(indent=2))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     use_fp16 = device == "cuda"
-    model = model.to(device)
-    model.compile()
+
+    # Load the tokenizer
+    tokenizer = tiktoken.get_encoding(args.tokenizer_name)
 
     # Load the data
-    # _, test = load_gsm8k(tokenizer, args.model_cfg.max_len)
     train = load_tinygsm(tokenizer, args.train_batch_size, args.model_cfg.max_len)
+
+    # Load the model
+    model = Model(args.model_cfg, vocab_size=tokenizer.max_token_value + 1).to(device)
 
     # Init the optimizer and the LR scheduler
     optimizer = adam_weight_decay(model, args.max_lr, args.weight_decay)
@@ -84,8 +110,23 @@ def run_tinygsm_sft(args: SftArgs) -> None:
     )
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
 
-    args.out_dir.mkdir(exist_ok=True, parents=True)
-    (args.out_dir / "args.json").write_text(args.model_dump_json(indent=2))
+    if args.resume_from_checkpoint is None:
+        assert args.pretrained_model_path is not None
+        model.load_state_dict(torch.load(args.pretrained_model_path))
+        start_step = 0
+    else:
+        # Load the model
+        start_step = restore_checkpoint(
+            args.resume_from_checkpoint,
+            model,
+            optimizer,
+            lr_scheduler,
+            scaler,
+            device,
+        )
+
+    model.compile()
+
     writer = SummaryWriter(log_dir=args.out_dir)
     logger.info(
         "starting training",
@@ -96,6 +137,9 @@ def run_tinygsm_sft(args: SftArgs) -> None:
 
     running_loss = torch.zeros((), device=device)
     for step, batch in enumerate(tqdm.tqdm(train, desc="training")):
+        if step <= start_step:
+            continue
+
         model.train()
 
         batch = cast(TinyGsmBatch, batch)
