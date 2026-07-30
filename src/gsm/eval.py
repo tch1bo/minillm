@@ -62,7 +62,7 @@ def run_eval(args: EvalArgs) -> None:
             model,
             tokenizer,
             prompt,
-            args.model_cfg.max_len,
+            400,  # args.model_cfg.max_len,
             args.device,
             use_fp16=args.device == "cuda",
             use_tqdm=True,
@@ -70,21 +70,21 @@ def run_eval(args: EvalArgs) -> None:
         print("-" * 120)
         print(greedy_answer[0])
         print(greedy_answer[1])
-        answers = generate_top_p(
-            model,
-            tokenizer,
-            sample.input_ids,
-            32,
-            args.model_cfg.max_len,
-            temperature=0.5,
-            top_p=0.9,
-            device=args.device,
-            use_fp16=args.device == "cuda",
-            use_tqdm=True,
-        )
-        for a in answers:
-            print("-" * 120)
-            print(a[0])
-            print(a[1])
+        # answers = generate_top_p(
+        #     model,
+        #     tokenizer,
+        #     sample.input_ids,
+        #     32,
+        #     args.model_cfg.max_len,
+        #     temperature=0.5,
+        #     top_p=0.9,
+        #     device=args.device,
+        #     use_fp16=args.device == "cuda",
+        #     use_tqdm=True,
+        # )
+        # for a in answers:
+        #     print("-" * 120)
+        #     print(a[0])
+        #     print(a[1])
 
         print("=" * 120)

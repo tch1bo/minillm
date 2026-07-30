@@ -15,7 +15,6 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src.gsm.data import TinyGsmBatch, load_tinygsm
 from src.model import (
-    Model,
     ModelLoadArgs,
     adam_weight_decay,
     chunked_cross_entropy_loss,
@@ -28,7 +27,7 @@ logger = get_logger()
 class SftArgs(ModelLoadArgs):
     seed: int = 42
     tokenizer_name: str = "gpt2"
-    train_batch_size: int = 15
+    train_batch_size: int = 12
     eval_batch_size: int = 48
     # Rule of thumb: set the max_lr to 0.1 of the max_lr used in pretraining
     max_lr: float = 3e-5
@@ -46,7 +45,7 @@ class SftArgs(ModelLoadArgs):
         description="The number of chunks to split the logits into for computing the cross entropy",
     )
     gradient_acc: int = Field(
-        default=32,
+        default=16,
         description="the number of batches to accumulate for a gradient update",
     )
     max_checkpoints: int = Field(
@@ -66,7 +65,7 @@ def run_tinygsm_sft(args: SftArgs) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     use_fp16 = device == "cuda"
     model = model.to(device)
-    model = cast(Model, torch.compile(model))
+    model.compile()
 
     # Load the data
     # _, test = load_gsm8k(tokenizer, args.model_cfg.max_len)
@@ -101,12 +100,17 @@ def run_tinygsm_sft(args: SftArgs) -> None:
 
         batch = cast(TinyGsmBatch, batch)
         x, targets = batch.input_ids.to(device), batch.targets.to(device)
-        loss = (
-            chunked_cross_entropy_loss(
-                model, x, targets, args.num_ce_chunks, is_train=True, use_fp16=use_fp16
+
+        with torch.autocast(x.device.type, dtype=torch.float16, enabled=use_fp16):
+            hidden = model.forward_no_lm_head(
+                x, input_pos=torch.arange(x.shape[1], device=device)
             )
-            / args.gradient_acc
-        )
+            loss = (
+                chunked_cross_entropy_loss(
+                    model, hidden, targets, args.num_ce_chunks, is_train=True
+                )
+                / args.gradient_acc
+            )
         running_loss += loss.detach()
         scaler.scale(loss).backward()
         should_save = False

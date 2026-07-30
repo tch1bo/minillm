@@ -52,12 +52,11 @@ class RotaryEmbedding(Module):
         self.register_buffer("rope_sin", freqs.sin(), persistent=False)
         self.register_buffer("rope_cos", freqs.cos(), persistent=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        num_tokens = x.shape[-2]
+    def forward(self, x: torch.Tensor, input_pos: torch.Tensor) -> torch.Tensor:
         x1 = x[..., ::2]
         x2 = x[..., 1::2]
-        sin = self.get_buffer("rope_sin")[:num_tokens]
-        cos = self.get_buffer("rope_cos")[:num_tokens]
+        sin = self.get_buffer("rope_sin").index_select(0, input_pos).to(x.dtype)
+        cos = self.get_buffer("rope_cos").index_select(0, input_pos).to(x.dtype)
         y1 = x1 * cos - x2 * sin
         y2 = x1 * sin + x2 * cos
         return torch.stack((y1, y2), dim=-1).flatten(-2)
@@ -80,6 +79,9 @@ class SWIGLU(Module):
 
 
 class Attention(Module):
+    _k_cache: torch.Tensor | None
+    _v_cache: torch.Tensor | None
+
     def __init__(self, cfg: Config, rope: RotaryEmbedding) -> None:
         super().__init__()
 
@@ -94,7 +96,10 @@ class Attention(Module):
         )
         self.rope = rope
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.register_buffer("_k_cache", None, persistent=False)
+        self.register_buffer("_v_cache", None, persistent=False)
+
+    def forward(self, x: torch.Tensor, input_pos: torch.Tensor) -> torch.Tensor:
         # x is (batch, token, model_dim)
         batch_size, num_tokens, model_dim = x.shape
 
@@ -102,11 +107,41 @@ class Attention(Module):
         # self.KV is (2, head, model_dim, attention_dim)
         q = torch.einsum("btd, hda -> bhta", x, self.Q)
         kv = torch.einsum("btd, nhda -> nbhta", x, self.KV)
+
+        # k, v are (batch, head, token, attention_dim)
         k, v = kv.unbind(0)
 
         # Apply ROPE embeddings
-        q = self.rope(q)
-        k = self.rope(k)
+        q = self.rope(q, input_pos)
+        k = self.rope(k, input_pos)
+
+        # NOTE: The EFFICIENT_ATTENTION backend (see the usage below)
+        # doesn't support the `enable_gqa` flag, so we have to repeat the k/v tensors.
+        k = k.repeat_interleave(self.Q.shape[0] // self.KV.shape[1], dim=1)
+        v = v.repeat_interleave(self.Q.shape[0] // self.KV.shape[1], dim=1)
+
+        use_kv_cache = self._k_cache is not None and self._v_cache is not None
+        if use_kv_cache:
+            # silence the type-checker
+            assert self._k_cache is not None
+            assert self._v_cache is not None
+
+            self._k_cache.index_copy_(2, input_pos, k)
+            self._v_cache.index_copy_(2, input_pos, v)
+
+            last_pos = int(input_pos[-1])
+            k = self._k_cache[:, :, : last_pos + 1]
+            v = self._v_cache[:, :, : last_pos + 1]
+
+            # num_tokens == 1 - we're in a decoding loop
+            # num_tokens  > 1 - we're prefilling the cache
+            is_causal = num_tokens > 1
+            if is_causal:
+                assert (
+                    int(input_pos[0]) == 0
+                ), "multi-token cache prefill is supported only from the start of the sequence"
+        else:
+            is_causal = True
 
         # Compute attention
         # NOTE: my GPU is from the older generation and FLASH_ATTENTION is not supported for it.
@@ -114,21 +149,16 @@ class Attention(Module):
         # slower, but still reduces the memory consumption from quadratic to linear (of max_len).
         # On a batch of 4, the memory dropped from 2736.0 MB to 218.2 MB
         # (this allowed increasing the batch size from 4 to 10).
-        # NOTE(2): An annoying part is that the EFFICIENT_ATTENTION backend
-        # doesn't support the `enable_gqa` flag, so we have to repeat the k/v tensors.
         with sdpa_kernel(
             [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH], set_priority=True
         ):
-            k = k.repeat_interleave(self.Q.shape[0] // self.KV.shape[1], dim=1)
-            v = v.repeat_interleave(self.Q.shape[0] // self.KV.shape[1], dim=1)
             # z is (b, head, token, attention_dim)
             z = torch.nn.functional.scaled_dot_product_attention(
                 q,
                 k,
                 v,
-                is_causal=True,
+                is_causal=is_causal,
                 dropout_p=0,
-                # This should be set to True on a newer GPU (and the interleaving should be dropped)
                 enable_gqa=False,
             )
         # reshape z to (b, token, attention_dim * num_heads)
@@ -137,6 +167,33 @@ class Attention(Module):
 
     def extra_repr(self) -> str:
         return f"Q={tuple(self.Q.shape)} KV={tuple(self.KV.shape)}"
+
+    def setup_kv_cache(self, batch_size: int, max_len: int, use_fp16: bool) -> None:
+        # if `enable_gqa` works and the `repeat_interleave` calls are not needed anymore, then
+        # the second dimension should become `self.KV.shape[1]`
+        shape = (batch_size, self.Q.shape[0], max_len, self.KV.shape[3])
+        self.register_buffer(
+            "_k_cache",
+            torch.empty(
+                shape,
+                dtype=torch.float16 if use_fp16 else torch.float32,
+                device=self.KV.device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_v_cache",
+            torch.empty(
+                shape,
+                dtype=torch.float16 if use_fp16 else torch.float32,
+                device=self.KV.device,
+            ),
+            persistent=False,
+        )
+
+    def delete_kv_cache(self) -> None:
+        self._k_cache = None
+        self._v_cache = None
 
 
 class Block(Module):
@@ -148,8 +205,8 @@ class Block(Module):
         self.ff_norm = torch.nn.RMSNorm([cfg.model_dim])
         self.ff = SWIGLU(cfg)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attention(self.attention_norm(x))
+    def forward(self, x: torch.Tensor, input_pos: torch.Tensor) -> torch.Tensor:
+        x = x + self.attention(self.attention_norm(x), input_pos)
         x = x + self.ff(self.ff_norm(x))
         return x
 
@@ -186,17 +243,22 @@ class Model(Module):
             torch.nn.init.normal_(block.ff.gate_and_value.weight, std=std)
             torch.nn.init.normal_(block.ff.down.weight, std=residual_std)
 
-    def forward_no_lm_head(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_no_lm_head(
+        self,
+        x: torch.Tensor,
+        # input_pos - the indices (positions) of the `x` tokens in the prompt
+        # typically:
+        #   for training (wo kv-cache): input_pos = torch.arange(seq_len)
+        #   when decoding (w kv-cache): input_pos = torch.tensor([cur_pos])
+        # In principle, `input_pos` could simply be `start_pos: int`, but that doesn't play well
+        # with `torch.compile`
+        input_pos: torch.Tensor,
+    ) -> torch.Tensor:
         y = self.embedding(x)
         for block in self.blocks:
-            y = block(y)
+            y = block(y, input_pos)
 
         return self.final_rms_norm(y)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO(chibo): KV-cache for inference?
-        y = self.forward_no_lm_head(x)
-        return self.lm_head(y)
 
     @staticmethod
     def load_from_file(
@@ -209,6 +271,21 @@ class Model(Module):
         d = {k.removeprefix("_orig_mod."): v for k, v in d.items()}
         m.load_state_dict(d)
         return m.to(device)
+
+    def setup_kv_cache(self, batch_size: int, max_len: int, use_fp16: bool) -> None:
+        for module in self.modules():
+            if isinstance(module, Attention):
+                module.setup_kv_cache(batch_size, max_len, use_fp16)
+
+    def delete_kv_cache(self) -> None:
+        for module in self.modules():
+            if isinstance(module, Attention):
+                module.delete_kv_cache()
+
+    def compile(self, *args, **kwargs) -> None:
+        self.forward_no_lm_head = torch.compile(  # type: ignore[method-assign]
+            self.forward_no_lm_head, *args, **kwargs
+        )
 
 
 def num_params(m: Module) -> int:
@@ -255,12 +332,11 @@ def adam_weight_decay(
 
 def chunked_cross_entropy_loss(
     model: Model,
-    x: torch.Tensor,
+    hidden: torch.Tensor,
     targets: torch.Tensor,
     num_ce_chunks: int,
     *,
     is_train: bool,
-    use_fp16: bool,
 ) -> torch.Tensor:
     # NOTE: the direct cross_entropy loss calculation was taking too much memory:
     #   batch_size * len_size * vocab_size * (sizeof(fp32) + sizeof(fp16))
@@ -274,16 +350,14 @@ def chunked_cross_entropy_loss(
             logits.flatten(0, 1), t.flatten(), ignore_index=-100, reduction="sum"
         )
 
-    with torch.autocast(x.device.type, dtype=torch.float16, enabled=use_fp16):
-        hidden = model.forward_no_lm_head(x)
-        loss = hidden.new_zeros((), dtype=torch.float32)
-        for h, t in zip(
-            hidden.chunk(num_ce_chunks, dim=1),
-            targets.chunk(num_ce_chunks, dim=1),
-        ):
-            if is_train:
-                loss = loss + checkpoint(_chunk_loss, h, t, use_reentrant=False)
-            else:
-                loss = loss + _chunk_loss(h, t)
+    loss = hidden.new_zeros((), dtype=torch.float32)
+    for h, t in zip(
+        hidden.chunk(num_ce_chunks, dim=1),
+        targets.chunk(num_ce_chunks, dim=1),
+    ):
+        if is_train:
+            loss = loss + checkpoint(_chunk_loss, h, t, use_reentrant=False)
+        else:
+            loss = loss + _chunk_loss(h, t)
 
-        return loss / targets.numel()
+    return loss / (targets != -100).sum().clamp(min=1)

@@ -242,6 +242,7 @@ def pre_train(args: PreTrainArgs) -> None:
     model = Model(ModelConfig(), vocab_size=args.get_tokenizer().max_token_value + 1)
     model.init_weights()
     model = model.to(device)
+    model.compile()
     logger.info(
         "model created",
         num_params=num_params(model),
@@ -280,12 +281,21 @@ def pre_train(args: PreTrainArgs) -> None:
         x, targets = batch[0].to(device, non_blocking=True), batch[1].to(
             device, non_blocking=True
         )
-        loss = (
-            chunked_cross_entropy_loss(
-                model, x, targets, args.num_ce_chunks, is_train=True, use_fp16=use_fp16
+
+        with torch.autocast(x.device.type, dtype=torch.float16, enabled=use_fp16):
+            hidden = model.forward_no_lm_head(
+                x, input_pos=torch.arange(x.shape[1], device=device)
             )
-            / args.gradient_acc
-        )
+            loss = (
+                chunked_cross_entropy_loss(
+                    model,
+                    hidden,
+                    targets,
+                    args.num_ce_chunks,
+                    is_train=True,
+                )
+                / args.gradient_acc
+            )
         running_loss += loss.detach()
         scaler.scale(loss).backward()
         should_run_eval = False
@@ -330,13 +340,15 @@ def pre_train(args: PreTrainArgs) -> None:
                     x, targets = b[0].to(device, non_blocking=True), b[1].to(
                         device, non_blocking=True
                     )
+                    hidden = model.forward_no_lm_head(
+                        x, input_pos=torch.arange(x.shape[1], device=device)
+                    )
                     loss = chunked_cross_entropy_loss(
                         model,
-                        x,
+                        hidden,
                         targets,
                         args.num_ce_chunks,
                         is_train=False,
-                        use_fp16=use_fp16,
                     )
 
                     val_loss += float(loss.item())

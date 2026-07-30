@@ -1,5 +1,6 @@
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Generator, Literal
 
 import tiktoken
 import torch
@@ -12,6 +13,17 @@ from src.model import Model, ModelLoadArgs
 from src.utils import get_logger
 
 logger = get_logger()
+
+
+@contextmanager
+def kv_cache(
+    model: Model, batch_size: int, max_len: int, use_fp16: bool
+) -> Generator[None, None, None]:
+    model.setup_kv_cache(batch_size, max_len, use_fp16)
+    try:
+        yield
+    finally:
+        model.delete_kv_cache()
 
 
 def _generate(
@@ -27,7 +39,6 @@ def _generate(
     use_fp16: bool,
     use_tqdm: bool = False,
 ) -> list[tuple[str, float]]:
-    # TODO(chibo): kv caching
     model.eval()
 
     if isinstance(prompt, str):
@@ -49,10 +60,22 @@ def _generate(
     with (
         torch.inference_mode(),
         torch.autocast(device, dtype=torch.float16, enabled=use_fp16),
+        kv_cache(model, num_samples, max_total_len, use_fp16),
     ):
 
-        for _ in iterator:
-            hidden = model.forward_no_lm_head(ids)
+        for i in iterator:
+            if i == len(input_tokens):
+                # prefill the cache
+                hidden = model.forward_no_lm_head(
+                    ids, input_pos=torch.arange(len(input_tokens), device=device)
+                )
+            else:
+                # decode one token at a time
+                hidden = model.forward_no_lm_head(
+                    ids[..., [i - 1]],
+                    input_pos=torch.tensor([i - 1], device=device, dtype=torch.long),
+                )
+
             logits = model.lm_head(hidden[:, -1, :]).float()
             model_logprobs = logits.log_softmax(dim=-1)
 
@@ -163,6 +186,7 @@ class InferArgs(ModelLoadArgs):
 
 
 def infer(args: InferArgs) -> None:
+    # TODO(chibo): change this
     model, tokenizer = args.load_model_and_tokenizer()
 
     tokens = tokenizer.encode(args.text)
