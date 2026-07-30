@@ -37,7 +37,7 @@ def _generate(
     greedy: bool,
     device: str,
     use_fp16: bool,
-    use_tqdm: bool = False,
+    tqdm_desc: str | None = None,
 ) -> list[tuple[str, float]]:
     model.eval()
 
@@ -54,8 +54,8 @@ def _generate(
     gen_lens = torch.zeros(num_samples, dtype=torch.long, device=device)
 
     iterator: Any = range(len(input_tokens), max_total_len)
-    if use_tqdm:
-        iterator = tqdm.tqdm(iterator)
+    if tqdm_desc:
+        iterator = tqdm.tqdm(iterator, desc=tqdm_desc)
 
     with (
         torch.inference_mode(),
@@ -116,8 +116,8 @@ def _generate(
         return tokenizer.decode(tokens)
 
     mean_logprobs = logprobs / gen_lens.clamp(min=1)
-    list_logprobs = mean_logprobs.tolist()
-    return [(decode(row), p) for row, p in zip(ids, list_logprobs, strict=True)]
+    list_probs = mean_logprobs.exp().tolist()
+    return [(decode(row), p) for row, p in zip(ids, list_probs, strict=True)]
 
 
 def generate_top_p(
@@ -130,7 +130,7 @@ def generate_top_p(
     top_p: float | None,
     device: str,
     use_fp16: bool,
-    use_tqdm: bool = False,
+    tqdm_desc: str | None = None,
 ) -> list[tuple[str, float]]:
     return _generate(
         model,
@@ -143,7 +143,7 @@ def generate_top_p(
         greedy=False,
         device=device,
         use_fp16=use_fp16,
-        use_tqdm=use_tqdm,
+        tqdm_desc=tqdm_desc,
     )
 
 
@@ -154,7 +154,7 @@ def generate_greedy(
     max_total_len: int,
     device: str,
     use_fp16: bool,
-    use_tqdm: bool = False,
+    tqdm_desc: str | None = None,
 ) -> tuple[str, float]:
     samples = _generate(
         model,
@@ -167,7 +167,7 @@ def generate_greedy(
         greedy=True,
         device=device,
         use_fp16=use_fp16,
-        use_tqdm=use_tqdm,
+        tqdm_desc=tqdm_desc,
     )
     assert len(samples) == 1
     return samples[0]
