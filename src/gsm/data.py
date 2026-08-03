@@ -1,4 +1,6 @@
+import ast
 import multiprocessing
+import warnings
 from dataclasses import dataclass
 from typing import NamedTuple, cast
 
@@ -115,6 +117,32 @@ class TinyGsmBatch(NamedTuple):
     targets: torch.Tensor
 
 
+def _remove_docstring(source: str) -> str:
+    """
+    Removes the docstring from TinyGSM code snippets.
+    We do this because we put the question into the prompt, before any Python code. Having the
+    the question inside the docstring (the way it is in the TinyGSM dataset) would redundantly
+    duplicate the question and increase the string length unnecessarily.
+
+    Raises on an unexpected (non-TinyGSM) code format.
+    """
+
+    # TinyGSM often includes latex-style \$ escapes
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        tree = ast.parse(source)
+    func_def = tree.body[0]
+    assert isinstance(func_def, ast.FunctionDef)
+    docstring = func_def.body[0]
+    assert isinstance(docstring, ast.Expr)
+
+    lines = source.splitlines(keepends=True)
+    new_lines = lines[: docstring.lineno - 1] + lines[docstring.end_lineno :]
+    new_source = "".join(new_lines)
+    ast.parse(new_source)
+    return new_source
+
+
 @dataclass
 class TinyGsmCollator:
     tokenizer: tiktoken.Encoding
@@ -125,7 +153,9 @@ class TinyGsmCollator:
         question = self.tokenizer.encode_ordinary_batch(
             [ex["question"] for ex in batch]
         )
-        code = self.tokenizer.encode_ordinary_batch([ex["code"] for ex in batch])
+        code = self.tokenizer.encode_ordinary_batch(
+            [_remove_docstring(ex["code"]) for ex in batch]
+        )
 
         tokens = []
         for i in range(len(batch)):
@@ -148,7 +178,12 @@ class TinyGsmCollator:
 
 
 def load_tinygsm(
-    tokenizer: tiktoken.Encoding, batch_size: int, max_len: int
+    tokenizer: tiktoken.Encoding,
+    *,
+    batch_size: int,
+    max_len: int,
+    seed: int,
+    start_at_batch: int | None,
 ) -> DataLoader:
     ds = datasets.load_dataset("TinyGSM/TinyGSM", split="train")
     sep = tokenizer.encode_ordinary(SEPARATOR)
@@ -171,13 +206,24 @@ def load_tinygsm(
         ds_size_before=len(ds),
         ds_size_after=len(filtered_ds),
     )
-    # TODO(chibo): implement fast forwarding through the dataset
+
+    # We need to shuffle the dataset directly (as opposed to shuffling inside the DataLoader), to
+    # enable instant "start at batch" functionality. Otherwise, we would have to "fast-forward" through
+    # the DataLoader, which would involve tokenization.
+    # HF caches the result of shuffling.
+    filtered_ds = filtered_ds.shuffle(seed=seed).flatten_indices()
+    if start_at_batch is not None:
+        filtered_ds = filtered_ds.select(
+            range(batch_size * start_at_batch, len(filtered_ds))
+        )
+
     return DataLoader(
         cast(torch.utils.data.Dataset, filtered_ds),
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=False,
         collate_fn=TinyGsmCollator(tokenizer, max_len, sep),
-        num_workers=4,
+        num_workers=8,
+        prefetch_factor=4,
         pin_memory=True,
         drop_last=True,
     )

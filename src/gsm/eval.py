@@ -140,7 +140,7 @@ class EvalArgs(ModelLoadArgs):
     num_batches: int | None = None
     out_path: Path = Field(
         default_factory=lambda: Path(
-            f"/tmp/gsm_eval_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.json"
+            f"./out/gsm_eval_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.json"
         )
     )
     seed: int = 42

@@ -123,7 +123,9 @@ class Attention(Module):
 
         # NOTE: The EFFICIENT_ATTENTION backend (see the usage below)
         # doesn't support the `enable_gqa` flag, so we have to repeat the k/v tensors.
-        # TODO(chibo): can I do some view-magic instead of repeat_interleave?
+        # We do the `repeat_interleave` before writing to the kv-cache so that we don't have to
+        # call `repeat_interleave` for the same k/v several times.
+        # This results in a bigger cache, but faster compute.
         k = k.repeat_interleave(self.Q.shape[0] // self.KV.shape[1], dim=1)
         v = v.repeat_interleave(self.Q.shape[0] // self.KV.shape[1], dim=1)
 
@@ -132,27 +134,30 @@ class Attention(Module):
             self._k_cache.index_copy_(2, input_pos, k)
             self._v_cache.index_copy_(2, input_pos, v)
 
-            last_pos = int(input_pos[-1])
-            k = self._k_cache[:, :, : last_pos + 1]
-            v = self._v_cache[:, :, : last_pos + 1]
+            # k = self._k_cache[:, :, : last_pos + 1]
+            # v = self._v_cache[:, :, : last_pos + 1]
+            k = self._k_cache
+            v = self._v_cache
+        else:
+            # Without a cache the source is just the current tokens,
+            # so trim the (batch, max_len) pad mask to the (batch, num_tokens) prefix.
+            pad_mask = pad_mask[:, : k.shape[2]]
 
-        # the pad_mask is expected to be for the full sequence
         assert pad_mask.shape == (batch_size, k.shape[2])
 
         # attn_bias is (batch_size, target_tokens, source_tokens)
         attn_bias = torch.zeros(
             (batch_size, num_tokens, k.shape[2]), dtype=q.dtype, device=q.device
         )
+        causal = torch.arange(k.shape[2], device=q.device) <= input_pos.unsqueeze(1)
+        attn_bias.masked_fill_(causal.logical_not().unsqueeze(0), float("-inf"))
         attn_bias.masked_fill_(pad_mask.unsqueeze(1), float("-inf"))
         if num_tokens > 1:
             # apply the causal mask
-            assert (
-                int(input_pos[0]) == 0
-            ), "multi-token cache prefill is supported only from the start of the sequence"
-            tril = torch.ones(
-                num_tokens, k.shape[2], dtype=torch.bool, device=q.device
-            ).tril(diagonal=0)
-            attn_bias.masked_fill_(tril.logical_not(), float("-inf"))
+            if not torch.compiler.is_compiling():
+                assert (
+                    int(input_pos[0]) == 0
+                ), "multi-token cache prefill is supported only from the start of the sequence"
 
             # This is a guard against left-padding. In that case, the first pad token in the sequence
             # would have an all -inf attention row, which would lead to NaNs after softmax.
@@ -276,6 +281,7 @@ class Model(Module):
         input_pos: torch.Tensor,
         # pad_mask is a boolean tensor that indicates which of the tokens are padding tokens
         # (True means "padding token", False - "real token")
+        # must be of the size (batch_size, max_len)
         pad_mask: torch.Tensor,
     ) -> torch.Tensor:
         y = self.embedding(x)

@@ -77,14 +77,14 @@ def _generate(
                 hidden = model.forward_no_lm_head(
                     ids,
                     input_pos=torch.arange(start_num_tokens, device=device),
-                    pad_mask=full_pad_mask[:, :i],
+                    pad_mask=full_pad_mask,
                 )
             else:
                 # decode one token at a time
                 hidden = model.forward_no_lm_head(
                     ids[..., [i - 1]],
                     input_pos=torch.tensor([i - 1], device=device, dtype=torch.long),
-                    pad_mask=full_pad_mask[:, :i],
+                    pad_mask=full_pad_mask,
                 )
 
             logits = model.lm_head(hidden[:, -1, :]).float()

@@ -283,7 +283,9 @@ def pre_train(args: PreTrainArgs) -> None:
         )
 
         with torch.autocast(x.device.type, dtype=torch.float16, enabled=use_fp16):
-            pad_mask = torch.zeros(x.shape, dtype=torch.bool, device=device)
+            pad_mask = torch.zeros(
+                (x.shape[0], args.model_cfg.max_len), dtype=torch.bool, device=device
+            )
             hidden = model.forward_no_lm_head(
                 x, input_pos=torch.arange(x.shape[1], device=device), pad_mask=pad_mask
             )
@@ -341,7 +343,11 @@ def pre_train(args: PreTrainArgs) -> None:
                     x, targets = b[0].to(device, non_blocking=True), b[1].to(
                         device, non_blocking=True
                     )
-                    pad_mask = torch.zeros(x.shape, dtype=torch.bool, device=device)
+                    pad_mask = torch.zeros(
+                        (x.shape[0], args.model_cfg.max_len),
+                        dtype=torch.bool,
+                        device=device,
+                    )
                     hidden = model.forward_no_lm_head(
                         x,
                         input_pos=torch.arange(x.shape[1], device=device),

@@ -14,7 +14,8 @@ from pydantic import BaseModel, Field, model_validator
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 
-from src.gsm.data import TinyGsmBatch, load_tinygsm
+from src.gsm.data import Gsm8kBatch, TinyGsmBatch, load_gsm8k, load_tinygsm
+from src.gsm.eval import EvalArgs, generate_for_batch
 from src.model import (
     Config as ModelConfig,
 )
@@ -36,12 +37,21 @@ logger = get_logger()
 class SftArgs(BaseModel):
     seed: int = 42
     tokenizer_name: str = "gpt2"
-    train_batch_size: int = 12
-    eval_batch_size: int = 48
-    # Rule of thumb: set the max_lr to 0.1 of the max_lr used in pretraining
-    max_lr: float = 3e-5
-    min_lr: float = 3e-6
-    weight_decay: float = 0.1
+    # The effective train batch size of 1024 is taken from the TinyGSM paper
+    train_batch_size: int = 16
+    gradient_acc: int = Field(
+        default=64,
+        description="the number of batches to accumulate for a gradient update",
+    )
+
+    eval_batch_size: int = 128
+
+    # max_lr is taken from the TinyGSM paper
+    max_lr: float = 1e-4
+    min_lr: float = 1e-5
+
+    # Taken from the TinyGSM paper
+    weight_decay: float = 0.01
     out_dir: Path = Field(
         default_factory=lambda: Path(
             f"./out/gsm_sft_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
@@ -52,10 +62,6 @@ class SftArgs(BaseModel):
     num_ce_chunks: int = Field(
         default=8,
         description="The number of chunks to split the logits into for computing the cross entropy",
-    )
-    gradient_acc: int = Field(
-        default=16,
-        description="the number of batches to accumulate for a gradient update",
     )
     max_checkpoints: int = Field(
         default=10,
@@ -92,7 +98,19 @@ def run_tinygsm_sft(args: SftArgs) -> None:
     tokenizer = tiktoken.get_encoding(args.tokenizer_name)
 
     # Load the data
-    train = load_tinygsm(tokenizer, args.train_batch_size, args.model_cfg.max_len)
+    train = load_tinygsm(
+        tokenizer,
+        batch_size=args.train_batch_size,
+        max_len=args.model_cfg.max_len,
+        seed=args.seed,
+        start_at_batch=0,
+    )
+    _, test = load_gsm8k(
+        tokenizer,
+        train_batch_size=1,
+        test_batch_size=args.eval_batch_size,
+        max_len=args.model_cfg.max_len,
+    )
 
     # Load the model
     model = Model(args.model_cfg, vocab_size=tokenizer.max_token_value + 1).to(device)
@@ -113,7 +131,6 @@ def run_tinygsm_sft(args: SftArgs) -> None:
     if args.resume_from_checkpoint is None:
         assert args.pretrained_model_path is not None
         model.load_state_dict(torch.load(args.pretrained_model_path))
-        start_step = 0
     else:
         # Load the model
         start_step = restore_checkpoint(
@@ -123,6 +140,14 @@ def run_tinygsm_sft(args: SftArgs) -> None:
             lr_scheduler,
             scaler,
             device,
+        )
+
+        train = load_tinygsm(
+            tokenizer,
+            batch_size=args.train_batch_size,
+            max_len=args.model_cfg.max_len,
+            seed=args.seed,
+            start_at_batch=start_step,
         )
 
     model.compile()
@@ -137,9 +162,6 @@ def run_tinygsm_sft(args: SftArgs) -> None:
 
     running_loss = torch.zeros((), device=device)
     for step, batch in enumerate(tqdm.tqdm(train, desc="training")):
-        if step <= start_step:
-            continue
-
         model.train()
 
         batch = cast(TinyGsmBatch, batch)
@@ -148,7 +170,9 @@ def run_tinygsm_sft(args: SftArgs) -> None:
         with torch.autocast(x.device.type, dtype=torch.float16, enabled=use_fp16):
             # We right-pad the batches for fine-tuning on TinyGSM, so technically there are padding
             # tokens, but they don't really matter for the attention computation.
-            pad_mask = torch.zeros(x.shape, dtype=torch.bool, device=device)
+            pad_mask = torch.zeros(
+                (x.shape[0], args.model_cfg.max_len), dtype=torch.bool, device=device
+            )
             hidden = model.forward_no_lm_head(
                 x, input_pos=torch.arange(x.shape[1], device=device), pad_mask=pad_mask
             )
@@ -189,6 +213,29 @@ def run_tinygsm_sft(args: SftArgs) -> None:
                 step=step,
                 max_checkpoints=args.max_checkpoints,
             )
+
+            test_gen = []
+            for test_batch in tqdm.tqdm(test, desc="running validation"):
+                test_batch = cast(Gsm8kBatch, test_batch)
+                test_gen.extend(
+                    generate_for_batch(
+                        model,
+                        EvalArgs(
+                            model_path=Path("doesnt-matter"),
+                            eval_greedy=True,
+                            eval_top_p=None,
+                            batch_size=args.eval_batch_size,
+                        ),
+                        tokenizer,
+                        test_batch,
+                        device,
+                    )
+                )
+            pass_1 = len(
+                [g for g in test_gen if g.greedy and g.answer == g.greedy.e.answer]
+            ) / len(test_gen)
+            logger.info("finished the validation step", pass_1=pass_1)
+            writer.add_scalar("test/pass_1", pass_1, step)
 
     save_checkpoint(
         args.out_dir,

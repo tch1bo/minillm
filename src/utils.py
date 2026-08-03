@@ -75,7 +75,7 @@ def save_checkpoint(
     step: int,
     max_checkpoints: int,
 ) -> None:
-    out_path = out_dir / f"checkpoint_{step:08d}.pt"
+    out_path = out_dir / f"checkpoint_{step + 1:08d}.pt"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     tmp_path = out_path.with_suffix(".tmp")
