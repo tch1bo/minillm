@@ -15,7 +15,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 
 from src.gsm.data import Gsm8kBatch, TinyGsmBatch, load_gsm8k, load_tinygsm
-from src.gsm.eval import EvalArgs, generate_for_batch
+from src.gsm.eval import EvalArgs, Gsm8kGeneration, generate_for_batch
 from src.model import (
     Config as ModelConfig,
 )
@@ -57,7 +57,7 @@ class SftArgs(BaseModel):
             f"./out/gsm_sft_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
         )
     )
-    save_every: int = 100
+    save_every: int = 500
     lr_warmup_ratio: float = 0.03
     num_ce_chunks: int = Field(
         default=8,
@@ -131,15 +131,19 @@ def run_tinygsm_sft(args: SftArgs) -> None:
     if args.resume_from_checkpoint is None:
         assert args.pretrained_model_path is not None
         model.load_state_dict(torch.load(args.pretrained_model_path))
+        start_step = 0
     else:
         # Load the model
-        start_step = restore_checkpoint(
-            args.resume_from_checkpoint,
-            model,
-            optimizer,
-            lr_scheduler,
-            scaler,
-            device,
+        start_step = (
+            restore_checkpoint(
+                args.resume_from_checkpoint,
+                model,
+                optimizer,
+                lr_scheduler,
+                scaler,
+                device,
+            )
+            + 1
         )
 
         train = load_tinygsm(
@@ -161,7 +165,8 @@ def run_tinygsm_sft(args: SftArgs) -> None:
     )
 
     running_loss = torch.zeros((), device=device)
-    for step, batch in enumerate(tqdm.tqdm(train, desc="training")):
+    for i, batch in enumerate(tqdm.tqdm(train, desc="training")):
+        step = start_step + i
         model.train()
 
         batch = cast(TinyGsmBatch, batch)
@@ -214,28 +219,61 @@ def run_tinygsm_sft(args: SftArgs) -> None:
                 max_checkpoints=args.max_checkpoints,
             )
 
-            test_gen = []
-            for test_batch in tqdm.tqdm(test, desc="running validation"):
-                test_batch = cast(Gsm8kBatch, test_batch)
-                test_gen.extend(
-                    generate_for_batch(
-                        model,
-                        EvalArgs(
-                            model_path=Path("doesnt-matter"),
-                            eval_greedy=True,
-                            eval_top_p=None,
-                            batch_size=args.eval_batch_size,
-                        ),
-                        tokenizer,
-                        test_batch,
-                        device,
+            test_gen: list[Gsm8kGeneration] = []
+            with torch.compiler.set_stance("force_eager"):
+                # Disable `torch.compile` to avoid recompiling with the kv-cache
+                for test_batch in tqdm.tqdm(test, desc="running validation"):
+                    test_batch = cast(Gsm8kBatch, test_batch)
+                    test_gen.extend(
+                        generate_for_batch(
+                            model,
+                            EvalArgs(
+                                model_path=Path("doesnt-matter"),
+                                eval_greedy=True,
+                                eval_top_p=None,
+                                batch_size=args.eval_batch_size,
+                            ),
+                            tokenizer,
+                            test_batch,
+                            device,
+                        )
                     )
-                )
             pass_1 = len(
                 [g for g in test_gen if g.greedy and g.answer == g.greedy.e.answer]
             ) / len(test_gen)
-            logger.info("finished the validation step", pass_1=pass_1)
+
+            no_answer = len(
+                [g for g in test_gen if g.greedy and g.greedy.e.answer is None]
+            ) / len(test_gen)
+            logger.info(
+                "finished the validation step", pass_1=pass_1, no_answer=no_answer
+            )
             writer.add_scalar("test/pass_1", pass_1, step)
+            writer.add_scalar("test/no_answer", no_answer, step)
+            for test_i, test_sample in enumerate(test_gen[:3]):
+                if test_sample.greedy is not None:
+                    a, g, e = (
+                        test_sample.answer,
+                        test_sample.greedy.g,
+                        test_sample.greedy.e,
+                    )
+                    writer.add_text(
+                        f"test/generation_{test_i}",
+                        f"""\
+## ground truth: {a}
+
+## generated code
+```python
+{g.output}
+```
+
+## exec result
+```json
+{e.model_dump_json(indent=2)}
+```
+""",
+                        step,
+                    )
 
     save_checkpoint(
         args.out_dir,
@@ -243,7 +281,7 @@ def run_tinygsm_sft(args: SftArgs) -> None:
         optimizer,
         lr_scheduler,
         scaler,
-        step=len(train),
+        step=start_step + len(train),
         max_checkpoints=args.max_checkpoints,
     )
     writer.close()

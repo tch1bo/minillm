@@ -139,7 +139,24 @@ def _remove_docstring(source: str) -> str:
     lines = source.splitlines(keepends=True)
     new_lines = lines[: docstring.lineno - 1] + lines[docstring.end_lineno :]
     new_source = "".join(new_lines)
-    ast.parse(new_source)
+
+    try:
+        ast.parse(new_source)
+    except Exception as e:
+        # Some tinygsm samples are broken. E.g.:
+        # def simple_math_problem() -> int:
+        #   '''
+        #   A fruit vendor sells bananas for $0.25 each.
+        #   If he sells 120 bananas in a week, how much money does he earn?
+        #   '''
+        # does not have a body.
+        # In this case we include the sample in a broken state to not mess up the batch
+
+        logger.error(
+            "failed parsing a tinygsm snippet",
+            exception=str(e),
+            source="\n" + source,
+        )
     return new_source
 
 

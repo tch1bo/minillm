@@ -134,8 +134,6 @@ class Attention(Module):
             self._k_cache.index_copy_(2, input_pos, k)
             self._v_cache.index_copy_(2, input_pos, v)
 
-            # k = self._k_cache[:, :, : last_pos + 1]
-            # v = self._v_cache[:, :, : last_pos + 1]
             k = self._k_cache
             v = self._v_cache
         else:
@@ -198,7 +196,7 @@ class Attention(Module):
         shape = (batch_size, self.Q.shape[0], max_len, self.KV.shape[3])
         self.register_buffer(
             "_k_cache",
-            torch.empty(
+            torch.zeros(
                 shape,
                 dtype=torch.float16 if use_fp16 else torch.float32,
                 device=self.KV.device,
@@ -207,7 +205,7 @@ class Attention(Module):
         )
         self.register_buffer(
             "_v_cache",
-            torch.empty(
+            torch.zeros(
                 shape,
                 dtype=torch.float16 if use_fp16 else torch.float32,
                 device=self.KV.device,
