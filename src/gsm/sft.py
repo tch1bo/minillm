@@ -15,7 +15,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 
 from src.gsm.data import Gsm8kBatch, TinyGsmBatch, load_gsm8k, load_tinygsm
-from src.gsm.eval import EvalArgs, Gsm8kGeneration, generate_for_batch
+from src.gsm.eval import Gsm8kGeneration, generate_for_batch
 from src.model import (
     Config as ModelConfig,
 )
@@ -227,15 +227,12 @@ def run_tinygsm_sft(args: SftArgs) -> None:
                     test_gen.extend(
                         generate_for_batch(
                             model,
-                            EvalArgs(
-                                model_path=Path("doesnt-matter"),
-                                eval_greedy=True,
-                                eval_top_p=None,
-                                batch_size=args.eval_batch_size,
-                            ),
                             tokenizer,
                             test_batch,
                             device,
+                            max_len=args.model_cfg.max_len,
+                            eval_greedy=True,
+                            eval_top_p=None,
                         )
                     )
             pass_1 = len(
@@ -252,26 +249,9 @@ def run_tinygsm_sft(args: SftArgs) -> None:
             writer.add_scalar("test/no_answer", no_answer, step)
             for test_i, test_sample in enumerate(test_gen[:3]):
                 if test_sample.greedy is not None:
-                    a, g, e = (
-                        test_sample.answer,
-                        test_sample.greedy.g,
-                        test_sample.greedy.e,
-                    )
                     writer.add_text(
                         f"test/generation_{test_i}",
-                        f"""\
-## ground truth: {a}
-
-## generated code
-```python
-{g.output}
-```
-
-## exec result
-```json
-{e.model_dump_json(indent=2)}
-```
-""",
+                        test_sample.greedy.to_tensorboard_md(test_sample.answer),
                         step,
                     )
 

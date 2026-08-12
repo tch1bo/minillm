@@ -27,8 +27,20 @@ def kv_cache(
 
 
 class Generation(NamedTuple):
+    # NOTE: the output does not include the `eot_token`
     output: str
     prob: float
+
+    # the input (prompt) tokens, with the left padding removed
+    input_tokens: torch.Tensor
+
+    # the output tokens, with the right padding removed
+    # NOTE: if an `eot_token` was generated, it is included into `output_tokens`
+    output_tokens: torch.Tensor
+
+    # True iff the generation was truncated due to `max_len` limit.
+    # In other words, True iff no `eot_token` was generated.
+    truncated: bool
 
 
 def _generate(
@@ -43,7 +55,7 @@ def _generate(
     greedy: bool,
     device: str,
     use_fp16: bool,
-    tqdm_desc: str | None = None,
+    tqdm_kwargs: dict | None = None,
 ) -> list[list[Generation]]:
     model.eval()
     batch_size, start_num_tokens = input_ids.shape
@@ -62,8 +74,8 @@ def _generate(
     full_pad_mask[:, :start_num_tokens] = pad_mask
 
     iterator: Any = range(start_num_tokens, max_total_len)
-    if tqdm_desc:
-        iterator = tqdm.tqdm(iterator, desc=tqdm_desc)
+    if tqdm_kwargs is not None:
+        iterator = tqdm.tqdm(iterator, **tqdm_kwargs)
 
     with (
         torch.inference_mode(),
@@ -88,6 +100,9 @@ def _generate(
                 )
 
             logits = model.lm_head(hidden[:, -1, :]).float()
+            if model.padded_vocab_size > model.vocab_size:
+                # Avoid predicting a non-existing token
+                logits[:, model.vocab_size :] = float("-inf")
             model_logprobs = logits.log_softmax(dim=-1)
 
             if temperature is not None:
@@ -121,25 +136,44 @@ def _generate(
             if finished.all():
                 break
 
-    def decode(row: torch.Tensor) -> str:
-        tokens = row.reshape(-1)[start_num_tokens:].tolist()
-        if tokenizer.eot_token in tokens:
-            tokens = tokens[: tokens.index(tokenizer.eot_token)]
-        return tokenizer.decode(tokens)
-
     mean_logprobs = logprobs / gen_lens.clamp(min=1)
     final_probs = mean_logprobs.exp()
 
-    def decode_sample(
+    ids, final_probs = ids.to("cpu"), final_probs.to("cpu")
+
+    def make_one_generation(row: torch.Tensor, prob: float) -> Generation:
+        all_tokens = row.reshape(-1)
+
+        # Get and unpad the input tokens
+        input_tokens = all_tokens[:start_num_tokens]
+        input_tokens = input_tokens[input_tokens != tokenizer.eot_token]
+
+        # Get and unpad the output tokens
+        output_tokens = all_tokens[start_num_tokens:]
+        unpadded_output = output_tokens[output_tokens != tokenizer.eot_token]
+        has_eot_token = len(unpadded_output) != len(output_tokens)
+        if has_eot_token:
+            # At least one eot_token was generated
+            output_tokens = output_tokens[: len(unpadded_output) + 1]
+
+        return Generation(
+            output=tokenizer.decode(unpadded_output.tolist()),
+            prob=prob,
+            input_tokens=input_tokens.clone(),
+            output_tokens=output_tokens.clone(),
+            truncated=not has_eot_token,
+        )
+
+    def make_generations_for_sample(
         ids_chunk: torch.Tensor, probs_chunk: torch.Tensor
     ) -> list[Generation]:
         return [
-            Generation(output=decode(row), prob=p)
+            make_one_generation(row, prob=p)
             for row, p in zip(ids_chunk, probs_chunk.tolist(), strict=True)
         ]
 
     return [
-        decode_sample(ic, pc)
+        make_generations_for_sample(ic, pc)
         for ic, pc in zip(
             ids.chunk(batch_size), final_probs.chunk(batch_size), strict=True
         )
@@ -157,7 +191,7 @@ def generate_top_p(
     top_p: float | None,
     device: str,
     use_fp16: bool,
-    tqdm_desc: str | None = None,
+    tqdm_kwargs: dict | None = None,
 ) -> list[list[Generation]]:
     result = _generate(
         model,
@@ -171,7 +205,7 @@ def generate_top_p(
         greedy=False,
         device=device,
         use_fp16=use_fp16,
-        tqdm_desc=tqdm_desc,
+        tqdm_kwargs=tqdm_kwargs,
     )
     # Sort the responses in decreasing order of probability.
     for i, r in enumerate(result):
@@ -187,7 +221,7 @@ def generate_greedy(
     max_total_len: int,
     device: str,
     use_fp16: bool,
-    tqdm_desc: str | None = None,
+    tqdm_kwargs: dict | None = None,
 ) -> list[Generation]:
     samples = _generate(
         model,
@@ -201,7 +235,7 @@ def generate_greedy(
         greedy=True,
         device=device,
         use_fp16=use_fp16,
-        tqdm_desc=tqdm_desc,
+        tqdm_kwargs=tqdm_kwargs,
     )
     for s in samples:
         assert len(s) == 1
@@ -243,7 +277,7 @@ def infer(args: InferArgs) -> None:
             max_len,
             args.device,
             use_fp16=args.device == "cuda",
-            tqdm_desc="infering",
+            tqdm_kwargs={"desc": "greedy"},
         )
     else:
         answers = generate_top_p(
@@ -257,7 +291,7 @@ def infer(args: InferArgs) -> None:
             top_p=args.top_p,
             device=args.device,
             use_fp16=args.device == "cuda",
-            tqdm_desc="infering",
+            tqdm_kwargs={"desc": "top_p"},
         )[0]
 
     for g in answers:

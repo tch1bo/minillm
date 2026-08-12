@@ -380,7 +380,7 @@ def chunked_cross_entropy_loss(
     # Splitting it into N chunks reduces the peak memory N times at a slightly higher compute
     # cost (we have to recompute the `lm_head(hidden)` in the backward pass)
     # This optimization allowed to increase the max batch size from 8 to 16 on my 12GB GPU
-    def _chunk_loss(h: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def chunk_loss(h: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         logits = model.lm_head(h)
         return cross_entropy(
             logits.flatten(0, 1), t.flatten(), ignore_index=-100, reduction="sum"
@@ -392,8 +392,8 @@ def chunked_cross_entropy_loss(
         targets.chunk(num_ce_chunks, dim=1),
     ):
         if is_train:
-            loss = loss + checkpoint(_chunk_loss, h, t, use_reentrant=False)
+            loss = loss + checkpoint(chunk_loss, h, t, use_reentrant=False)
         else:
-            loss = loss + _chunk_loss(h, t)
+            loss = loss + chunk_loss(h, t)
 
     return loss / (targets != -100).sum().clamp(min=1)

@@ -1,14 +1,15 @@
+import json
 import os
 import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence, cast
+from typing import NamedTuple, Sequence, cast
 
 import tiktoken
 import torch
 import tqdm
-from pydantic import BaseModel, Field, RootModel
+from pydantic import Field
 
 from src.gsm.data import Gsm8kBatch, load_gsm8k
 from src.infer import Generation, generate_greedy, generate_top_p
@@ -18,11 +19,14 @@ from src.utils import get_logger
 logger = get_logger()
 
 
-class ExecutionResult(BaseModel):
+class ExecutionResult(NamedTuple):
     returncode: int | None = None
     exception_str: str | None = None
     stdout: str | None = None
     answer: int | None = None
+
+    def to_json_str(self) -> str:
+        return json.dumps(self._asdict(), indent=2)
 
 
 def _run_one_sample(code: str, timeout: float = 1.0) -> ExecutionResult:
@@ -56,22 +60,38 @@ def _run_one_sample(code: str, timeout: float = 1.0) -> ExecutionResult:
     if result.returncode != 0:
         return ExecutionResult(returncode=result.returncode)
 
+    stdout = result.stdout[:4096]
     try:
         # The code samples in TinyGSM use / instead of //, so the model learns to use it as well.
         # To handle this, we first convert the result to float and then to an int.
-        answer = int(float(result.stdout))
+        answer = int(float(stdout))
     except (ValueError, OverflowError) as e:
-        return ExecutionResult(exception_str=str(e), stdout=result.stdout)
+        return ExecutionResult(exception_str=str(e), stdout=stdout)
 
     return ExecutionResult(answer=answer)
 
 
-class GenerationAndExec(BaseModel):
+class GenerationAndExec(NamedTuple):
     g: Generation
     e: ExecutionResult
 
+    def to_tensorboard_md(self, ground_truth_answer: int) -> str:
+        return f"""\
+## ground truth: {ground_truth_answer}
 
-class Gsm8kGeneration(BaseModel):
+## generated code
+```python
+{self.g.output}
+```
+
+## exec result
+```json
+{self.e.to_json_str()}
+```
+"""
+
+
+class Gsm8kGeneration(NamedTuple):
     # The ground truth answer
     answer: int
 
@@ -86,53 +106,58 @@ class Gsm8kGeneration(BaseModel):
 
 def generate_for_batch(
     model: Model,
-    args: EvalArgs,
     tokenizer: tiktoken.Encoding,
     batch: Gsm8kBatch,
     device: str,
-    use_tqdm: bool = False,
+    *,
+    max_len: int,
+    eval_greedy: bool = False,
+    eval_top_p: int | None = None,
+    top_p: float = 0.95,
+    temp: float = 0.7,
+    tqdm_kwargs: dict | None = None,
 ) -> list[Gsm8kGeneration]:
     use_fp16 = device == "cuda"
 
     greedy: Sequence[GenerationAndExec | None] = [None] * len(batch)
-    if args.eval_greedy:
+    if eval_greedy:
         gs = generate_greedy(
             model,
             tokenizer,
             batch.input_ids,
             batch.pad_mask,
-            args.model_cfg.max_len,
+            max_len,
             device,
             use_fp16=use_fp16,
-            tqdm_desc="greedy sampling" if use_tqdm else None,
+            tqdm_kwargs=tqdm_kwargs,
         )
         es = [_run_one_sample(g.output) for g in gs]
         greedy = [GenerationAndExec(g=g, e=e) for (g, e) in zip(gs, es, strict=True)]
 
-    top_p: list[list[GenerationAndExec]] = [[]] * len(batch)
-    if args.eval_top_p is not None:
+    top_p_gens: list[list[GenerationAndExec]] = [[]] * len(batch)
+    if eval_top_p is not None:
         gss = generate_top_p(
             model,
             tokenizer,
             batch.input_ids,
             batch.pad_mask,
-            args.eval_top_p,
-            args.model_cfg.max_len,
-            temperature=args.temp,
-            top_p=args.top_p,
+            eval_top_p,
+            max_len,
+            temp,
+            top_p=top_p,
             device=device,
             use_fp16=use_fp16,
-            tqdm_desc="top-p sampling" if use_tqdm else None,
+            tqdm_kwargs=tqdm_kwargs,
         )
         ess = [[_run_one_sample(g.output) for g in gs] for gs in gss]
-        top_p = [
+        top_p_gens = [
             [GenerationAndExec(g=g, e=e) for (g, e) in zip(gs, es, strict=True)]
             for (gs, es) in zip(gss, ess, strict=True)
         ]
 
     return [
         Gsm8kGeneration(answer=a, greedy=g, top_p=p)
-        for (a, g, p) in zip(batch.answers.tolist(), greedy, top_p, strict=True)
+        for (a, g, p) in zip(batch.answers.tolist(), greedy, top_p_gens, strict=True)
     ]
 
 
@@ -200,17 +225,22 @@ def run_eval(args: EvalArgs) -> None:
         generations.extend(
             generate_for_batch(
                 model,
-                args,
                 tokenizer,
                 cast(Gsm8kBatch, batch),
                 args.device,
-                use_tqdm=False,
+                max_len=args.model_cfg.max_len,
+                eval_greedy=args.eval_greedy,
+                eval_top_p=args.eval_top_p,
+                top_p=args.top_p,
+                temp=args.temp,
+                tqdm_kwargs=None,
             )
         )
 
-    args.out_path.write_text(
-        RootModel[list[Gsm8kGeneration]](generations).model_dump_json(indent=2)
-    )
-    logger.info("wrote all results", out_path=args.out_path)
+    # TODO(chibo): reimplement this
+    # args.out_path.write_text(
+    #     RootModel[list[Gsm8kGeneration]](generations).model_dump_json(indent=2)
+    # )
+    # logger.info("wrote all results", out_path=args.out_path)
 
     print_stats(generations, args)

@@ -1,10 +1,12 @@
 import datetime
 import math
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import structlog
 import torch
+from structlog.typing import EventDict
+from torch.utils.data import Dataset
 from tqdm import tqdm
 
 
@@ -24,13 +26,21 @@ class _TqdmWriteFile:
         pass
 
 
+def _round_floats(logger: Any, method_name: str, event_dict: EventDict):
+    for key, value in event_dict.items():
+        if isinstance(value, float):
+            event_dict[key] = f"{value:.3f}"
+    return event_dict
+
+
 structlog.configure(
     processors=[
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         _add_timestamp,
         structlog.processors.StackInfoRenderer(),
-        structlog.dev.ConsoleRenderer(),
+        _round_floats,
+        structlog.dev.ConsoleRenderer(sort_keys=False),
     ],
     wrapper_class=structlog.make_filtering_bound_logger(0),
     context_class=dict,
@@ -115,3 +125,14 @@ def restore_checkpoint(
     step = state["step"]
     logger.info("restored checkpoint", path=path, step=step)
     return step
+
+
+class ListDataset[T](Dataset):
+    def __init__(self, lst: list[T]) -> None:
+        self._list = lst
+
+    def __getitem__(self, index: int) -> T:
+        return self._list[index]
+
+    def __len__(self) -> int:
+        return len(self._list)
