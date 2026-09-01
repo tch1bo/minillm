@@ -53,7 +53,7 @@ class GrpoArgs(BaseModel):
     group_size: int = Field(
         default=8, description="how many rollouts to generate for one question"
     )
-    miu_steps: int = Field(
+    mu_steps: int = Field(
         default=3, description="how many gradient updates to do per model update"
     )
     top_p: float = 0.95
@@ -67,7 +67,7 @@ class GrpoArgs(BaseModel):
     beta: float = Field(default=0.004, description="The beta used for KL-divergence")
     num_iterations: int = Field(
         default=10000,
-        description="the total number of iterations (one iteration involves `miu_steps` gradient updates",
+        description="the total number of iterations (one iteration involves `mu_steps` gradient updates",
     )
     min_gradient_update_size: int = Field(
         default=512,
@@ -98,7 +98,7 @@ class GrpoArgs(BaseModel):
 
     @property
     def total_gradient_updates(self) -> int:
-        return self.num_iterations * self.miu_steps
+        return self.num_iterations * self.mu_steps
 
 
 class Rollout(NamedTuple):
@@ -184,6 +184,8 @@ def chunked_log_probs(
     is_train: bool,
     use_fp16: bool,
 ) -> torch.Tensor:
+    # NOTE: see `chunked_cross_entropy_loss` for more details on why chunking is needed
+
     with (
         torch.autocast(input_ids.device.type, dtype=torch.float16, enabled=use_fp16),
         contextlib.nullcontext() if is_train else torch.no_grad(),
@@ -267,9 +269,9 @@ def run_gsm_grpo(args: GrpoArgs) -> None:
     lr_scheduler = LambdaLR(optimizer, lr_lambda)
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
 
-    def global_miu_step(iteration: int, miu_step: int) -> int:
-        assert miu_step < args.miu_steps
-        return iteration * args.miu_steps + miu_step
+    def global_mu_step(iteration: int, mu_step: int) -> int:
+        assert mu_step < args.mu_steps
+        return iteration * args.mu_steps + mu_step
 
     # Load the model
     if args.resume_from_checkpoint is None:
@@ -322,7 +324,7 @@ def run_gsm_grpo(args: GrpoArgs) -> None:
     for iteration in tqdm.trange(
         start_iteration, start_iteration + args.num_iterations, desc="training"
     ):
-        step = global_miu_step(iteration, miu_step=0)
+        step = global_mu_step(iteration, mu_step=0)
 
         # Step 1 - generate the rollouts and compute the advantages
         rollouts: list[Rollout] = []
@@ -414,12 +416,12 @@ def run_gsm_grpo(args: GrpoArgs) -> None:
                 batch_size=args.train_batch_size,
             )
         )
-        for miu_step in range(0, args.miu_steps):
+        for mu_step in range(0, args.mu_steps):
             running_kl_div.zero_()
             running_token_count.zero_()
             fraction_of_clipped_ratios.zero_()
             for i, tr_batch in enumerate(
-                tqdm.tqdm(tr_batches, leave=False, desc=f"miu_step {miu_step}")
+                tqdm.tqdm(tr_batches, leave=False, desc=f"mu_step {mu_step}")
             ):
                 tr_batch = cast(TokenizedRolloutBatch, tr_batch)
                 input_ids, pad_mask, adv = (
@@ -437,7 +439,7 @@ def run_gsm_grpo(args: GrpoArgs) -> None:
                     is_train=True,
                     use_fp16=use_fp16,
                 ).float()
-                if miu_step == 0:
+                if mu_step == 0:
                     # NOTE: with the current model implementation, there's no difference between
                     # model.train() and model.eval() (we don't use dropout/batch norm/etc.)
                     # Hence it's safe to simply do logprobs.detach() here
@@ -477,7 +479,7 @@ def run_gsm_grpo(args: GrpoArgs) -> None:
                 )
                 scaler.scale(loss).backward()
 
-            # End of the miu_step
+            # End of the mu_step
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scale_before = scaler.get_scale()
@@ -490,22 +492,22 @@ def run_gsm_grpo(args: GrpoArgs) -> None:
             writer.add_scalar(
                 "training/grad_norm",
                 grad_norm.item(),
-                global_miu_step(iteration, miu_step),
+                global_mu_step(iteration, mu_step),
             )
             writer.add_scalar(
                 "training/num_tokens",
                 running_token_count.item(),
-                global_miu_step(iteration, miu_step),
+                global_mu_step(iteration, mu_step),
             )
             writer.add_scalar(
                 "training/kl_div",
                 (running_kl_div / running_token_count).item(),
-                global_miu_step(iteration, miu_step),
+                global_mu_step(iteration, mu_step),
             )
             writer.add_scalar(
                 "training/fraction_of_clipped_ratios",
                 fraction_of_clipped_ratios.div_(len(rollouts)).item(),
-                global_miu_step(iteration, miu_step),
+                global_mu_step(iteration, mu_step),
             )
 
         # Step 3 - periodically run evals and save weights
